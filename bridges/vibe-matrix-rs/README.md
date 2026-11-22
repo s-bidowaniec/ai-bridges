@@ -24,16 +24,35 @@ Workspace:
 | `bridge-core` | `MatrixClient` (sync / send_text / react) przez reqwest + Bearer |
 | `bridge-headless` | pętla sync, allowlista, 👀/✅/❌, limit 3800 znaków odpowiedzi |
 
-## Presety agentów (`AGENT`)
+## Presety agentów (`AGENT`) i trwały kontekst rozmowy
 
-| `AGENT` | komenda |
+Każda instancja utrzymuje trwały `session_id` / `conversation_id` / `thread_id` w atomowym pliku stanu (`*.state.json`, wyprowadzanym z `STATE_FILE`), dzięki czemu kolejne wiadomości w pokoju Matrix zachowują pełny kontekst również po restarcie usługi.
+
+| `AGENT` | wywołanie i wznowienie sesji |
 |---|---|
-| `vibe` | `vibe -p {prompt} --yolo` |
-| `agy` | `agy -p {prompt} --dangerously-skip-permissions` |
-| `claude` | `claude -p {prompt} --dangerously-skip-permissions` |
-| `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox {prompt}` |
+| `vibe` | `vibe --workdir <dir> [--resume <id>] --yolo --output json --prompt=<tekst>` |
+| `agy` | `agy [--conversation <id>] --dangerously-skip-permissions --output-format json --print-timeout <N>s --print=<tekst>` |
+| `claude` | `claude -p [--resume <id>] --dangerously-skip-permissions --output-format json -- <tekst>` |
+| `codex` | `codex exec [resume <id>] --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --json -o <tmp> -- <tekst>` |
 
-Własna komenda: `AGENT_CMD="moj-agent --prompt {prompt}"` ( `{prompt}` = treść wiadomości, spacje = separator).
+Własna komenda: `AGENT_CMD="moj-agent --prompt {prompt}"` (`{prompt}` = treść wiadomości, opcjonalnie `{session_id}`).
+
+### Komendy sterujące w pokoju Matrix (działają natychmiast, nawet gdy agent pracuje)
+
+- `/status` — stan agenta (`gotowy`/`pracuje`), aktywne `session_id`, liczba tur, kolejka, uptime.
+- `/new` lub `/reset` — czyści zapisaną sesję i zaczyna nową rozmowę od zera.
+- `/stop` lub `/cancel` — przerywa bieżące wywołanie agenta (wysyła `SIGTERM` → `SIGKILL` do całej grupy procesów).
+- `/help` — skrót komend.
+
+### Odporność (robustness)
+
+- **Nieblokujący sync loop** — sync Matrix i worker agenta działają w osobnych zadaniach Tokio połączonych kolejką FIFO (`32`), więc długie wywołanie agenta nie zamraża synchronizacji ani komend `/stop`/`/status`.
+- **Typing indicator** (`m.typing`) odświeżany co 20 s podczas pracy agenta.
+- **Brak zakleszczeń pipe i procesów zombie** — równoległe drenowanie `stdout`/`stderr` (z limitem pamięci) oraz izolacja w grupie procesów Unix (`process_group(0)`).
+- **Auto-odzyskiwanie sesji** — jeśli `--resume` / `--conversation` zawiedzie przez wygasłą sesję, mostek automatycznie ponawia wywołanie w świeżej sesji.
+- **Retry z backoffem** — idempotentne ponawianie `send_text` (to samo `txn_id`, obsługa `429 retry_after_ms` i `502`/`503`) oraz dzielenie długich odpowiedzi bez paniki na znakach UTF-8.
+- **Redakcja sekretów** — `MATRIX_ACCESS_TOKEN` oraz klucze z `AGENT_ENV_KEYS` są maskowane przed wysyłką na Matrix.
+- **Graceful shutdown** — `SIGTERM`/`SIGINT` zatrzymuje drzewo procesu agenta i atomowo zapisuje stan.
 
 ## Konfiguracja (env)
 
