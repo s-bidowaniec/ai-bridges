@@ -165,6 +165,12 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&cfg.vibe_workdir).context("create vibe_workdir")?;
 
     let client = MatrixClient::new(&cfg.homeserver, &cfg.token, &cfg.room_id)?;
+    // watcher: pliki z voice/out/ -> m.audio na Matrix (tryb "konektor": terminal odpowiada głosem)
+    {
+        let cfg2 = cfg.clone();
+        let client2 = client.clone();
+        tokio::spawn(async move { voice_out_watcher(cfg2, client2).await });
+    }
     let mut seen: HashSet<String> = load_seen(&cfg.state_file);
     let mut agent: String = load_str_opt(&cfg.agent_file).unwrap_or_else(|| "vibe".to_string());
     let mut voice_on: bool = load_str_opt(&cfg.voice_file).map(|v| v == "on").unwrap_or(false);
@@ -341,6 +347,48 @@ async fn run_agent_tmux(cfg: &Config, agent: &str, prompt: &str) -> Result<Strin
     Ok(reply)
 }
 
+/// Watcher katalogu voice/out/: każdy nowy plik audio -> upload -> m.audio na Matrix.
+/// (To jest "konektor": terminal agenta w trybie voice odpowiada plikiem tutaj.)
+async fn voice_out_watcher(cfg: Config, client: MatrixClient) {
+    use std::collections::HashSet as HS2;
+    let out_dir = format!("{}/out", cfg.voice_dir);
+    let _ = std::fs::create_dir_all(&out_dir);
+    let mut sent: HS2<String> = HS2::new();
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let rd = match std::fs::read_dir(&out_dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if sent.contains(&name) {
+                continue;
+            }
+            if !(name.ends_with(".opus") || name.ends_with(".ogg") || name.ends_with(".wav") || name.ends_with(".mp3")) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(e.path()) else { continue };
+            let mime = if name.ends_with(".wav") { "audio/wav" } else { "audio/ogg" };
+            match client.upload_media(&bytes, &name, mime).await {
+                Ok(mxc) => {
+                    let dur = (bytes.len() / 4000) as u32 * 10; // estymata
+                    let wf = pseudo_waveform(bytes.len());
+                    match client.send_audio(&format!("🎙️ {} (odpowiedź głosowa)", name), &mxc, mime, bytes.len(), dur.max(500), &wf).await {
+                        Ok(eid) => {
+                            tracing::info!(event = %eid, file = %name, "voice out -> Matrix");
+                            sent.insert(name.clone());
+                            let _ = std::fs::remove_file(e.path());
+                        }
+                        Err(err) => tracing::warn!("send_audio fail: {err:#}"),
+                    }
+                }
+                Err(err) => tracing::warn!("upload fail: {err:#}"),
+            }
+        }
+    }
+}
+
 /// Odpowiada na Matrix: głosem (TTS→m.audio) gdy voice_on, inaczej tekstem.
 fn thread_rel(root: &str) -> serde_json::Value {
     serde_json::json!({"rel_type": "m.thread", "event_id": root})
@@ -391,6 +439,36 @@ async fn handle_voice(
     let safe_name: String = fname.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }).collect();
     let path = format!("{}/{}", cfg.uploads_dir, safe_name);
     let _ = std::fs::write(&path, &bytes);
+
+    // v8 PASSTHROUGH: wrzuć audio do voice/in/, terminal (agent w trybie voice) odpowiada do voice/out/
+    let stem = safe_name.trim_end_matches(|c| c != '.').to_string();
+    let stem = stem.rsplit('.').next().unwrap_or(&safe_name).to_string();
+    let in_dir = format!("{}/in", cfg.voice_dir);
+    let out_dir = format!("{}/out", cfg.voice_dir);
+    std::fs::create_dir_all(&in_dir).ok();
+    std::fs::create_dir_all(&out_dir).ok();
+    let in_file = format!("{}/{}", in_dir, safe_name);
+    let _ = std::fs::write(&in_file, &bytes);
+    tracing::info!(file = %in_file, "voice in -> czekam na out/ ({}s)", cfg.voice_fallback_secs);
+    let mut answered = false;
+    for _ in 0..cfg.voice_fallback_secs {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Ok(rd) = std::fs::read_dir(&out_dir) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n.starts_with(&stem) {
+                    answered = true; // watcher wyśle to jako m.audio
+                    break;
+                }
+            }
+        }
+        if answered { break; }
+    }
+    if answered {
+        client.react(&ev.id, "✅").await.ok();
+        return Ok(());
+    }
+    tracing::warn!("brak odpowiedzi z voice/out/ po {}s — fallback API (STT->agent->TTS)", cfg.voice_fallback_secs);
 
     let text = match stt(cfg, &bytes, &safe_name, &mime).await {
         Ok(t) if !t.trim().is_empty() => t,

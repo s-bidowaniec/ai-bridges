@@ -81,3 +81,11 @@ Architektura: agent (vibe/codex/claude/agy) żyje w stałej sesji **tmux**, brid
   - klonuje repo do ~/ai-bridges, buduje, konfiguruje `~/.config/vibe-matrix-rs/env`, enable'uje `systemd --user`
   - potem w pokoju: `/voice on` → seria voice messages = ciągła konwersacja z kontekstem (tmux)
 - prawdziwy call `m.call` (WebRTC/MSC3245, answer bota) = Faza 6 (osobny klient WebRTC, np. aiortc w Pythonowym bridge)
+
+## v8 — voice jako KONNEKTOR (passthrough do terminala)
+Bridge tylko przekazuje audio między Matrix a terminalem agenta ( który ma własny tryb voice):
+- `m.audio` od użytkownika → plik w `VOICE_DIR/in/<stem>.wav`
+- agent w tmux (tryb voice) odpowiada plikiem w `VOICE_DIR/out/<stem>.opus` → watcher (1s) → upload → `m.audio` na Matrix
+- fallback: jeśli w `VOICE_FALLBACK_SECS` (default 15s) terminal nie odpowie → lokalny STT→agent→TTS (v6 API)
+- `/voice on|off|new` jak wcześniej; env: `VOICE_DIR`
+- uwaga: prawdziwy m.call (WebRTC) NIE jest potrzebny — rozmowa głosowa idzie przez voice messages + terminal
