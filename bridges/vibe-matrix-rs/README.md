@@ -89,3 +89,10 @@ Bridge tylko przekazuje audio między Matrix a terminalem agenta ( który ma wł
 - fallback: jeśli w `VOICE_FALLBACK_SECS` (default 15s) terminal nie odpowie → lokalny STT→agent→TTS (v6 API)
 - `/voice on|off|new` jak wcześniej; env: `VOICE_DIR`
 - uwaga: prawdziwy m.call (WebRTC) NIE jest potrzebny — rozmowa głosowa idzie przez voice messages + terminal
+
+## v9 — dispatch per agent + fixy E2E (Faza 6 test)
+- vibe/codex/claude: subprocess `AGENT -p --resume <sid> --yolo --output json` (szybko, bez menu TUI; sesja per agent w `<SESSION_FILE>.<agent>`)
+- agy: tmux TUI (send-keys/capture-pane) — tam działa tryb voice
+- fix: media download v1 first (ten Synapse nie ma v3 download), HOME agenta = AGENT_HOME (nie /root)
+- fix: m.audio NIE może mieć m.relates_to (Synapse 400) — voice odpowiedzi poza wątkiem, tekst w wątku
+- E2E test OK: m.audio -> voice/in -> fallback 15s -> STT -> vibe -> TTS -> m.audio (MSC3245 voice) w pokoju

@@ -179,13 +179,17 @@ impl MatrixClient {
     pub async fn download_mxc(&self, mxc: &str) -> Result<(String, Vec<u8>, String)> {
         let rest = mxc.strip_prefix("mxc://").context("zły mxc (brak mxc://)")?;
         let (server, media_id) = rest.split_once('/').context("zły mxc (brak /)")?;
-        let url = format!(
-            "{}/_matrix/media/v3/download/{}/{}",
-            self.base,
-            enc(server),
-            enc(media_id)
-        );
-        let resp = self.authed(self.http.get(&url)).send().await.context("download: send")?;
+        // Uwaga: ten Synapse (matrix.owl-post.eu) wystawia tylko legacy v1 — v3 daje 404.
+        // Próbujemy v1, fallback v3 (inne serwery).
+        let url_v1 = format!("{}/_matrix/client/v1/media/download/{}/{}", self.base, enc(server), enc(media_id));
+        let url_v3 = format!("{}/_matrix/media/v3/download/{}/{}", self.base, enc(server), enc(media_id));
+        let resp = self.authed(self.http.get(&url_v1)).send().await.context("download: send v1")?;
+        let resp = if resp.status().is_success() {
+            resp
+        } else {
+            tracing::warn!(mxc, "v1 404, próbuję v3");
+            self.authed(self.http.get(&url_v3)).send().await.context("download: send v3")?
+        };
         let status = resp.status();
         let mime = resp
             .headers()

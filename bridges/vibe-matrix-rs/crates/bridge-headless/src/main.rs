@@ -7,6 +7,7 @@ use bridge_core::{Event, MatrixClient};
 use std::collections::HashSet;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
+use tokio::process::Command;
 
 #[derive(Debug, PartialEq)]
 enum BotCommand {
@@ -163,6 +164,7 @@ async fn main() -> Result<()> {
     tracing::info!(room = %cfg.room_id, homeserver = %cfg.homeserver, "vibe-matrix-rs headless v5 (tmux) start");
 
     std::fs::create_dir_all(&cfg.vibe_workdir).context("create vibe_workdir")?;
+    std::fs::create_dir_all(&cfg.agent_home).context("create agent_home")?;
 
     let client = MatrixClient::new(&cfg.homeserver, &cfg.token, &cfg.room_id)?;
     // watcher: pliki z voice/out/ -> m.audio na Matrix (tryb "konektor": terminal odpowiada głosem)
@@ -314,8 +316,8 @@ async fn handle_event(
         return Ok(());
     }
 
-    // zwykła wiadomość (lub /komenda agenta typu /model) -> tmux
-    match run_agent_tmux(cfg, agent, body).await {
+    // zwykła wiadomość (lub /komenda agenta typu /model) -> agent
+    match run_agent(cfg, agent, body).await {
         Ok(text) => {
             let clean = clean_ansi(&text);
             let reply = if clean.is_empty() {
@@ -336,6 +338,73 @@ async fn handle_event(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum AgentMode {
+    /// vibe/codex/claude: headless `AGENT -p --resume <sid>` — szybko, bez menu TUI, kontekst w pliku sesji
+    Subprocess,
+    /// agy (Antigravity): żyje w tmux TUI (ma tryb voice) — send-keys + capture-pane
+    Tmux,
+}
+
+fn agent_mode(agent: &str) -> AgentMode {
+    match agent.to_ascii_lowercase().as_str() {
+        "agy" | "antigravity" => AgentMode::Tmux,
+        _ => AgentMode::Subprocess,
+    }
+}
+
+/// Dispatch per agent.
+async fn run_agent(cfg: &Config, agent: &str, prompt: &str) -> Result<String> {
+    match agent_mode(agent) {
+        AgentMode::Subprocess => run_agent_subprocess(cfg, agent, prompt).await,
+        AgentMode::Tmux => run_agent_tmux(cfg, agent, prompt).await,
+    }
+}
+
+/// Subprocess tryb: `vibe -p <prompt> --yolo --output json [--resume <sid>]`; sesja per agent w pliku.
+async fn run_agent_subprocess(cfg: &Config, agent: &str, prompt: &str) -> Result<String> {
+    let sess_file = format!("{}.{}", cfg.session_file, agent);
+    let sid = load_str_opt(&sess_file);
+    let mut cmd = Command::new(agent_cmd(agent).context("nieznany agent")?);
+    cmd.arg("-p").arg(prompt).arg("--yolo").arg("--output").arg("json");
+    if let Some(s) = &sid {
+        cmd.arg("--resume").arg(s);
+    }
+    cmd.current_dir(&cfg.vibe_workdir)
+        .env_clear()
+        .env("PATH", "/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("HOME", &cfg.agent_home)
+        .env("TERM", "dumb");
+    for key in &cfg.vibe_env_keys {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    cmd.kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().with_context(|| format!("spawn {agent}"))?;
+    let out = tokio::time::timeout(Duration::from_secs(cfg.vibe_timeout_secs), child.wait_with_output())
+        .await
+        .context("timeout agenta")?
+        .context("wait agenta")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("{agent} exit {:?}: {}", out.status.code(), &stderr[..stderr.len().min(500)]);
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    match parse_vibe_json(&stdout) {
+        Some((sid, text)) if !text.is_empty() => {
+            if !sid.is_empty() {
+                let _ = save_str(&sess_file, &sid);
+            }
+            Ok(text)
+        }
+        _ => Ok(stdout),
+    }
 }
 
 /// Wysyła prompt do sesji tmux agenta i czeka na odpowiedź (capture-pane). Zwraca nowy tekst ekranu.
@@ -402,7 +471,9 @@ async fn send_reply(client: &MatrixClient, cfg: &Config, text: &str, voice_on: b
                 let mxc = client.upload_media(&bytes, "reply.opus", "audio/ogg").await?;
                 let wf = pseudo_waveform(text.len());
                 let body = format!("🎙️ {}", safe_truncate(text, 200));
-                return client.send_audio_rel(&body, &mxc, "audio/ogg", bytes.len(), dur, &wf, rel).await;
+                // UWAGA: ten Synapse odrzuca m.audio z m.relates_to ("Cannot start threads from an event with a relation")
+                // więc voice odpowiedź idzie jako zwykła wiadomość (bez wątku); tekst może być w wątku.
+                return client.send_audio_rel(&body, &mxc, "audio/ogg", bytes.len(), dur, &wf, None).await;
             }
             Err(e) => tracing::warn!("TTS nieudane, wysyłam tekst: {e:#}"),
         }
@@ -484,7 +555,7 @@ async fn handle_voice(
     };
     tracing::info!(event = %ev.id, len = text.len(), "STT: {text:.80}");
     let prompt = format!("[voice message od {}]: {}", ev.sender, text);
-    match run_agent_tmux(cfg, agent, &prompt).await {
+    match run_agent(cfg, agent, &prompt).await {
         Ok(reply) => {
             let clean = clean_ansi(&reply);
             let reply = if clean.is_empty() {
@@ -565,6 +636,26 @@ async fn tts(cfg: &Config, text: &str) -> Result<(Vec<u8>, u32)> {
 /// Prosta pseudo-fala (sinusoida) do voice message.
 fn pseudo_waveform(_text_len: usize) -> Vec<u32> {
     (0..40).map(|i| (300.0 + (i as f32 * 0.7).sin() * 200.0) as u32).collect()
+}
+
+fn parse_vibe_json(s: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    let arr = v.as_array()?;
+    let sid = arr.iter().find_map(|e| e.get("sessionId")?.as_str()).unwrap_or("").to_string();
+    let mut text = String::new();
+    for e in arr.iter().rev() {
+        if e.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            if let Some(content) = e.get("content").and_then(|c| c.as_array()) {
+                for c in content {
+                    if c.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(t) = c.get("text").and_then(|t| t.as_str()) { text.push_str(t); }
+                    }
+                }
+            }
+            if !text.is_empty() { break; }
+        }
+    }
+    Some((sid, text))
 }
 
 #[cfg(test)]
