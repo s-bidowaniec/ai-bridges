@@ -11,31 +11,13 @@ pub struct Config {
     pub room_id: String,
     pub bot_user_id: String,
     pub allowed_users: Vec<String>,
-    /// Preset agenta (vibe|agy|claude|codex) lub pusty gdy AGENT_CMD.
-    pub agent: String,
-    /// Jawna komenda (bez presetu): AGENT_CMD="claude -p {prompt} --dangerously-skip-permissions".
-    pub agent_cmd: Vec<String>,
-    pub agent_timeout_secs: u64,
+    pub vibe_cmd: String,
+    pub vibe_timeout_secs: u64,
     pub sync_timeout_ms: u32,
     pub state_file: String,
-    pub agent_env_keys: Vec<String>,
-    /// PATH dla procesu agenta.
-    pub agent_path: String,
-    /// HOME dla procesu agenta (tam są poświadczenia OAuth agentów).
-    pub agent_home: String,
-}
-
-/// Presety poleceń headless dla supported agentów. `{prompt}` = treść wiadomości.
-pub fn agent_preset(name: &str) -> Option<Vec<&'static str>> {
-    match name {
-        "vibe" => Some(vec!["vibe", "-p", "{prompt}", "--yolo"]),
-        "agy" => Some(vec!["agy", "-p", "{prompt}", "--dangerously-skip-permissions"]),
-        "claude" => Some(vec!["claude", "-p", "{prompt}", "--dangerously-skip-permissions"]),
-        "codex" => Some(vec![
-            "codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "{prompt}",
-        ]),
-        _ => None,
-    }
+    pub session_file: String,
+    pub vibe_workdir: String,
+    pub vibe_env_keys: Vec<String>,
 }
 
 impl Config {
@@ -44,15 +26,8 @@ impl Config {
             std::env::var(k).with_context(|| format!("brak zmiennej env {k}"))
         };
         let allowed = std::env::var("MATRIX_ALLOWED_USERS").unwrap_or_default();
-        let agent_env_keys = std::env::var("AGENT_ENV_KEYS")
-            .or_else(|_| std::env::var("VIBE_ENV_KEYS"))
-            .unwrap_or_default();
-        let agent_cmd_raw = std::env::var("AGENT_CMD").unwrap_or_default();
-        let agent_cmd: Vec<String> = if agent_cmd_raw.trim().is_empty() {
-            Vec::new()
-        } else {
-            agent_cmd_raw.split_whitespace().map(|s| s.to_string()).collect()
-        };
+        let vibe_env_keys = std::env::var("VIBE_ENV_KEYS")
+            .unwrap_or_else(|_| "MISTRAL_API_KEY".to_string());
         Ok(Self {
             homeserver: std::env::var("MATRIX_HOMESERVER")
                 .unwrap_or_else(|_| "https://matrix.owl-post.eu".to_string()),
@@ -60,32 +35,14 @@ impl Config {
             room_id: get("MATRIX_ROOM_ID")?,
             bot_user_id: get("MATRIX_BOT_USER_ID")?,
             allowed_users: allowed.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-            agent: std::env::var("AGENT").unwrap_or_else(|_| "vibe".to_string()),
-            agent_cmd,
-            agent_timeout_secs: std::env::var("AGENT_TIMEOUT_SECS")
-                .or_else(|_| std::env::var("VIBE_TIMEOUT_SECS"))
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(600),
+            vibe_cmd: std::env::var("VIBE_CMD").unwrap_or_else(|_| "vibe".to_string()),
+            vibe_timeout_secs: std::env::var("VIBE_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(600),
             sync_timeout_ms: std::env::var("SYNC_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30000),
-            state_file: std::env::var("STATE_FILE")
-                .unwrap_or_else(|_| format!("{}/.local/state/vibe-matrix-rs/seen.txt", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))),
-            agent_env_keys: agent_env_keys.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-            agent_path: std::env::var("AGENT_PATH")
-                .unwrap_or_else(|_| std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into())),
-            agent_home: std::env::var("AGENT_HOME")
-                .unwrap_or_else(|_| std::env::var("HOME").unwrap_or_else(|_| "/root".into())),
+            state_file: std::env::var("STATE_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/seen.txt".to_string()),
+            session_file: std::env::var("SESSION_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/session.txt".to_string()),
+            vibe_workdir: std::env::var("VIBE_WORKDIR").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/vibe-work".to_string()),
+            vibe_env_keys: vibe_env_keys.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
         })
-    }
-
-    /// argv agenta z podmienionym {prompt}.
-    pub fn agent_argv(&self, prompt: &str) -> Result<Vec<String>> {
-        let base: Vec<String> = if !self.agent_cmd.is_empty() {
-            self.agent_cmd.clone()
-        } else {
-            agent_preset(&self.agent)
-                .with_context(|| format!("nieznany preset AGENT={} (dozwolone: vibe, agy, claude, codex; albo ustaw AGENT_CMD)", self.agent))?
-                .iter().map(|s| s.to_string()).collect()
-        };
-        Ok(base.iter().map(|a| a.replace("{prompt}", prompt)).collect())
     }
 }
 
@@ -115,6 +72,64 @@ pub fn save_seen(path: &str, seen: &HashSet<String>) -> Result<()> {
     v.sort();
     std::fs::write(path, v.iter().map(|s| format!("{s}\n")).collect::<String>())
         .context("zapis state_file")
+}
+
+/// Session id vibe (do `--resume`), trzymany w osobnym pliku.
+pub fn load_session(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn save_session(path: &str, session_id: &str) -> Result<()> {
+    if let Some(dir) = Path::new(path).parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, format!("{session_id}\n")).context("zapis session_file")
+}
+
+/// Bezpieczne obcięcie do `max` bajtów na granicy znaku UTF-8 (nie panikuje przy emoji/PL znakach).
+pub fn safe_truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_utf8_safe() {
+        let s = "zażółć gęślą jaźń 🦀🦀🦀 kotek";
+        for max in 0..s.len() {
+            let t = safe_truncate(s, max);
+            assert!(t.len() <= max);
+            assert!(s.starts_with(t));
+        }
+    }
+
+    #[test]
+    fn ansi_clean() {
+        assert_eq!(clean_ansi("\x1b[31mhello\x1b[0m"), "hello");
+        assert_eq!(clean_ansi("a\n\n\n\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn session_roundtrip() {
+        let dir = std::env::temp_dir().join("vibe-matrix-rs-test");
+        let p = dir.join("session.txt");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(load_session(p.to_str().unwrap()), None);
+        save_session(p.to_str().unwrap(), "abc-123").unwrap();
+        assert_eq!(load_session(p.to_str().unwrap()), Some("abc-123".to_string()));
+    }
 }
 
 /// Usuwa kody ANSI/OSC i znaki kontrolne z odpowiedzi TUI vibe.
