@@ -11,11 +11,31 @@ pub struct Config {
     pub room_id: String,
     pub bot_user_id: String,
     pub allowed_users: Vec<String>,
-    pub vibe_cmd: String,
-    pub vibe_timeout_secs: u64,
+    /// Preset agenta (vibe|agy|claude|codex) lub pusty gdy AGENT_CMD.
+    pub agent: String,
+    /// Jawna komenda (bez presetu): AGENT_CMD="claude -p {prompt} --dangerously-skip-permissions".
+    pub agent_cmd: Vec<String>,
+    pub agent_timeout_secs: u64,
     pub sync_timeout_ms: u32,
     pub state_file: String,
-    pub vibe_env_keys: Vec<String>,
+    pub agent_env_keys: Vec<String>,
+    /// PATH dla procesu agenta.
+    pub agent_path: String,
+    /// HOME dla procesu agenta (tam są poświadczenia OAuth agentów).
+    pub agent_home: String,
+}
+
+/// Presety poleceń headless dla supported agentów. `{prompt}` = treść wiadomości.
+pub fn agent_preset(name: &str) -> Option<Vec<&'static str>> {
+    match name {
+        "vibe" => Some(vec!["vibe", "-p", "{prompt}", "--yolo"]),
+        "agy" => Some(vec!["agy", "-p", "{prompt}", "--dangerously-skip-permissions"]),
+        "claude" => Some(vec!["claude", "-p", "{prompt}", "--dangerously-skip-permissions"]),
+        "codex" => Some(vec![
+            "codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "{prompt}",
+        ]),
+        _ => None,
+    }
 }
 
 impl Config {
@@ -24,8 +44,15 @@ impl Config {
             std::env::var(k).with_context(|| format!("brak zmiennej env {k}"))
         };
         let allowed = std::env::var("MATRIX_ALLOWED_USERS").unwrap_or_default();
-        let vibe_env_keys = std::env::var("VIBE_ENV_KEYS")
-            .unwrap_or_else(|_| "MISTRAL_API_KEY".to_string());
+        let agent_env_keys = std::env::var("AGENT_ENV_KEYS")
+            .or_else(|_| std::env::var("VIBE_ENV_KEYS"))
+            .unwrap_or_default();
+        let agent_cmd_raw = std::env::var("AGENT_CMD").unwrap_or_default();
+        let agent_cmd: Vec<String> = if agent_cmd_raw.trim().is_empty() {
+            Vec::new()
+        } else {
+            agent_cmd_raw.split_whitespace().map(|s| s.to_string()).collect()
+        };
         Ok(Self {
             homeserver: std::env::var("MATRIX_HOMESERVER")
                 .unwrap_or_else(|_| "https://matrix.owl-post.eu".to_string()),
@@ -33,12 +60,32 @@ impl Config {
             room_id: get("MATRIX_ROOM_ID")?,
             bot_user_id: get("MATRIX_BOT_USER_ID")?,
             allowed_users: allowed.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-            vibe_cmd: std::env::var("VIBE_CMD").unwrap_or_else(|_| "vibe".to_string()),
-            vibe_timeout_secs: std::env::var("VIBE_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(600),
+            agent: std::env::var("AGENT").unwrap_or_else(|_| "vibe".to_string()),
+            agent_cmd,
+            agent_timeout_secs: std::env::var("AGENT_TIMEOUT_SECS")
+                .or_else(|_| std::env::var("VIBE_TIMEOUT_SECS"))
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(600),
             sync_timeout_ms: std::env::var("SYNC_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30000),
-            state_file: std::env::var("STATE_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/seen.txt".to_string()),
-            vibe_env_keys: vibe_env_keys.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            state_file: std::env::var("STATE_FILE")
+                .unwrap_or_else(|_| format!("{}/.local/state/vibe-matrix-rs/seen.txt", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))),
+            agent_env_keys: agent_env_keys.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            agent_path: std::env::var("AGENT_PATH")
+                .unwrap_or_else(|_| std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into())),
+            agent_home: std::env::var("AGENT_HOME")
+                .unwrap_or_else(|_| std::env::var("HOME").unwrap_or_else(|_| "/root".into())),
         })
+    }
+
+    /// argv agenta z podmienionym {prompt}.
+    pub fn agent_argv(&self, prompt: &str) -> Result<Vec<String>> {
+        let base: Vec<String> = if !self.agent_cmd.is_empty() {
+            self.agent_cmd.clone()
+        } else {
+            agent_preset(&self.agent)
+                .with_context(|| format!("nieznany preset AGENT={} (dozwolone: vibe, agy, claude, codex; albo ustaw AGENT_CMD)", self.agent))?
+                .iter().map(|s| s.to_string()).collect()
+        };
+        Ok(base.iter().map(|a| a.replace("{prompt}", prompt)).collect())
     }
 }
 

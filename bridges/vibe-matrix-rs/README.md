@@ -1,36 +1,107 @@
-# vibe-matrix-rs (Rust MVP — Faza 0+1 z docs/ROADMAP-RUST.md)
+# vibe-matrix-rs
 
-Mostek Matrix room ↔ `vibe -p --yolo` (headless), przepisany z `bridges/vibe-matrix` (Python).
+Rustowy mostek headless: **pokój Matrix ↔ lokalny agent CLI** (`vibe`, `agy`, `claude`, `codex`).
 
-## Co działa w MVP
-- sync long-poll `/_matrix/client/v3/sync` (reqwest + Bearer, bez matrix-sdk — szybszy build)
-- allowlist nadawców (`MATRIX_ALLOWED_USERS`), własne wiadomości bota ignorowane
-- dedup eventów przez plik stanu (`STATE_FILE`, nadpisywany set — docelowo `redb`)
-- reakcje 👀 / ✅ / ❌ na wiadomość
-- subprocess `vibe -p <msg> --yolo` z `env_clear()` + whitelist (`VIBE_ENV_KEYS`), `kill_on_drop`, timeout
-- czyszczenie ANSI z odpowiedzi TUI (`clean_ansi`), limit 3800 znaków odpowiedzi
-- systemd unit z podstawowym hardeningiem
+Wiadomość w pokoju → reakcja 👀 → `agent -p <tekst> ...` (non-interactive, czysty env, timeout) → odpowiedź w pokoju → ✅ (lub ❌).
 
-## Env (/etc/vibe-matrix-rs.env, chmod 600)
+> **Repo jest PUBLICZNE.** Sekrety (tokeny Matrix, klucze) żyją wyłącznie w plikach env
+> poza repo (`chmod 600`), ładowanych przez systemd (`EnvironmentFile`). Zobacz `.env.example`.
+> Nigdy nie commituj plików `.env`, tokenów ani stanu (`seen.txt`).
+
+## Architektura
+
 ```
-MATRIX_HOMESERVER=https://matrix.owl-post.eu
-MATRIX_ACCESS_TOKEN=...
-MATRIX_ROOM_ID=!....:matrix.owl-post.eu
-MATRIX_BOT_USER_ID=@vibe-rs:matrix.owl-post.eu
-MATRIX_ALLOWED_USERS=@stanislaw:matrix.owl-post.eu
-VIBE_CMD=vibe
-VIBE_TIMEOUT_SECS=600
-SYNC_TIMEOUT_MS=30000
-STATE_FILE=/var/lib/vibe-matrix-rs/seen.txt
-VIBE_ENV_KEYS=MISTRAL_API_KEY
+Matrix room ──sync──▶ bridge-headless ──spawn──▶ agent CLI (preset) ──▶ stdout ──▶ send_text ──▶ room
+                ▲                                                    │
+                └──────────── seen.txt (dedup eventów) ◀────────────┘
 ```
 
-## Build & run (na VPS)
+Workspace:
+
+| crate | rola |
+|---|---|
+| `bridge-common` | `Config::from_env`, presety agentów, `clean_ansi`, seen-set |
+| `bridge-core` | `MatrixClient` (sync / send_text / react) przez reqwest + Bearer |
+| `bridge-headless` | pętla sync, allowlista, 👀/✅/❌, limit 3800 znaków odpowiedzi |
+
+## Presety agentów (`AGENT`)
+
+| `AGENT` | komenda |
+|---|---|
+| `vibe` | `vibe -p {prompt} --yolo` |
+| `agy` | `agy -p {prompt} --dangerously-skip-permissions` |
+| `claude` | `claude -p {prompt} --dangerously-skip-permissions` |
+| `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox {prompt}` |
+
+Własna komenda: `AGENT_CMD="moj-agent --prompt {prompt}"` ( `{prompt}` = treść wiadomości, spacje = separator).
+
+## Konfiguracja (env)
+
+Skopiuj `.env.example` i wypełnij. Zmienne: `MATRIX_HOMESERVER`, `MATRIX_ACCESS_TOKEN` (token **bota**),
+`MATRIX_ROOM_ID`, `MATRIX_BOT_USER_ID`, `MATRIX_ALLOWED_USERS`, `AGENT` / `AGENT_CMD`,
+`AGENT_TIMEOUT_SECS`, `SYNC_TIMEOUT_MS`, `STATE_FILE`, `AGENT_HOME`, `AGENT_PATH`, `AGENT_ENV_KEYS`, `RUST_LOG`.
+
+Token bota: `curl -X POST $HS/_matrix/client/v3/login -d '{"type":"m.login.password","user":"BOT","password":"..."}'`
+
+## Instalacja lokalna (komputer użytkownika, systemd --user)
+
+```bash
+git clone git@github.com:s-bidowaniec/ai-bridges.git ~/ai-bridges
+cd ~/ai-bridges/bridges/vibe-matrix-rs
+cargo build --release
+mkdir -p ~/.local/bin && cp target/release/bridge-headless ~/.local/bin/
+
+# unit użytkownika (szablon: jedna instancja na agenta)
+mkdir -p ~/.config/systemd/user
+cp systemd/vibe-matrix-rs@.user.service ~/.config/systemd/user/vibe-matrix-rs@.service
+
+# env per agent (sekrety lokalnie, 600!)
+mkdir -p ~/.config/vibe-matrix-rs
+install -m 600 .env.example ~/.config/vibe-matrix-rs/vibe.env   # i wyedytuj
+# ... analogicznie agy.env, claude.env, codex.env (inne AGENT, pokój, bot, token)
+
+systemctl --user daemon-reload
+systemctl --user enable --now vibe-matrix-rs@vibe vibe-matrix-rs@agy vibe-matrix-rs@claude vibe-matrix-rs@codex
+journalctl --user -u vibe-matrix-rs@vibe -f
 ```
+
+## Instalacja na VPS (system, root)
+
+```bash
 cd /opt/ai-bridges/bridges/vibe-matrix-rs
 cargo build --release
-systemctl enable --now vibe-matrix-rs
-journalctl -u vibe-matrix-rs -f
+cp systemd/vibe-matrix-rs@.service /etc/systemd/system/
+install -m 600 .env.example /etc/vibe-matrix-rs/vibe.env   # wyedytuj
+systemctl daemon-reload
+systemctl enable --now vibe-matrix-rs@vibe
+journalctl -u vibe-matrix-rs@vibe -f
 ```
 
-## Dalej (Faza 2+): tmux/TUI, media, redb dedup, landlock, governor rate-limit, metryki.
+Legacy (pojedyncza instancja): `systemd/vibe-matrix-rs.service` + `/etc/vibe-matrix-rs.env`.
+
+## Tworzenie bota i pokoju
+
+```bash
+# na hoście Synapse (zamknięta rejestracja):
+register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml http://localhost:8008 -u vibe -p HASLO --no-admin
+# pokój (private) przez API jako admin + invite bota; bot: POST /rooms/{id}/join
+```
+
+## Narzędzia
+
+`tools/mx.py` — pomocniczy klient (send/read/rooms) bez sekretów w repo; token z `MATRIX_ADMIN_TOKEN`
+lub `~/.config/vibe-matrix-rs/admin.env` (600).
+
+```bash
+python3 tools/mx.py send '!POKOJ:matrix.owl-post.eu' "cześć"
+python3 tools/mx.py read '!POKOJ:matrix.owl-post.eu' 10
+```
+
+## Bezpieczeństwo
+
+- Token tylko w nagłówku `Authorization: Bearer`, nigdy w URL/logach.
+- `MATRIX_ALLOWED_USERS` — allowlista nadawców (puste = wszyscy w pokoju; pokój powinien być private).
+- Proces agenta dostaje czysty env: `PATH`/`HOME`/`TERM` + klucze z `AGENT_ENV_KEYS`.
+- Unit systemowy: `ProtectSystem=strict`, `ProtectHome=read-only`, `ReadWritePaths` tylko tam gdzie trzeba.
+- Uwaga: ten build Synapse nie ma endpointu `/events/{id}/reactions/...` — reakcje idą przez
+  `send/m.reaction` z `key` **wewnątrz** `m.relates_to`.

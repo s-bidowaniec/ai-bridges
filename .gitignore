@@ -32,3 +32,6 @@ work/uploads/
 
 # System
 .DS_Store
+
+# Rust
+target/

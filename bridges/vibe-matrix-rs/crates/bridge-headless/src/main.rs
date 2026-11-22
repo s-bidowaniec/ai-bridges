@@ -69,7 +69,7 @@ async fn handle_event(
     tracing::info!(event = %ev.id, sender = %ev.sender, "nowa wiadomość ({} znaków)", body.len());
     client.react(&ev.id, "👀").await.ok();
 
-    match run_vibe(cfg, body).await {
+    match run_agent(cfg, body).await {
         Ok(text) => {
             let clean = clean_ansi(&text);
             let reply = if clean.is_empty() {
@@ -84,7 +84,7 @@ async fn handle_event(
             client.react(&ev.id, "✅").await.ok();
         }
         Err(e) => {
-            let msg = format!("⚠️ błąd vibe: {e:#}");
+            let msg = format!("⚠️ błąd agenta: {e:#}");
             client.send_text(&msg).await.ok();
             client.react(&ev.id, "❌").await.ok();
         }
@@ -92,15 +92,18 @@ async fn handle_event(
     Ok(())
 }
 
-/// Uruchamia `vibe -p <prompt> --yolo` z czystym env (tylko whitelist) i timeoutem.
-async fn run_vibe(cfg: &Config, prompt: &str) -> Result<String> {
-    let mut cmd = Command::new(&cfg.vibe_cmd);
-    cmd.arg("-p").arg(prompt).arg("--yolo")
-        .env_clear()
-        .env("PATH", "/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-        .env("HOME", "/root")
+/// Uruchamia agenta (preset AGENT lub AGENT_CMD) z czystym env (tylko whitelist) i timeoutem.
+async fn run_agent(cfg: &Config, prompt: &str) -> Result<String> {
+    let argv = cfg.agent_argv(prompt)?;
+    let mut cmd = Command::new(&argv[0]);
+    for a in &argv[1..] {
+        cmd.arg(a);
+    }
+    cmd.env_clear()
+        .env("PATH", &cfg.agent_path)
+        .env("HOME", &cfg.agent_home)
         .env("TERM", "dumb");
-    for key in &cfg.vibe_env_keys {
+    for key in &cfg.agent_env_keys {
         if let Ok(v) = std::env::var(key) {
             cmd.env(key, v);
         }
@@ -110,15 +113,22 @@ async fn run_vibe(cfg: &Config, prompt: &str) -> Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let child = cmd.spawn().with_context(|| format!("spawn {}", cfg.vibe_cmd))?;
-    let timeout = Duration::from_secs(cfg.vibe_timeout_secs);
+    let child = cmd.spawn().with_context(|| format!("spawn {}", argv[0]))?;
+    let timeout = Duration::from_secs(cfg.agent_timeout_secs);
     let out = tokio::time::timeout(timeout, child.wait_with_output())
         .await
-        .context("timeout vibe")?
-        .context("wait vibe")?;
+        .context("timeout agenta")?
+        .context("wait agenta")?;
     if !out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("vibe exit {:?}: {}", out.status.code(), &stderr[..stderr.len().min(500)]);
+        let tail = |s: &str| s.trim().chars().rev().take(500).collect::<String>().chars().rev().collect::<String>();
+        anyhow::bail!(
+            "agent exit {:?}: stdout: {} | stderr: {}",
+            out.status.code(),
+            tail(&stdout),
+            tail(&stderr)
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }

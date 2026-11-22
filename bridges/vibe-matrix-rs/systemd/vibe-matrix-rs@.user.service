@@ -1,0 +1,18 @@
+# Szablon użytkownika (lokalny komputer, np. Mac/Fedora):
+#   env: ~/.config/vibe-matrix-rs/<agent>.env   (chmod 600!)
+#   start: systemctl --user enable --now vibe-matrix-rs@vibe
+# Binarka: ~/.local/bin/bridge-headless (patrz README — sekcja "Instalacja lokalna")
+[Unit]
+Description=vibe-matrix-rs (Rust bridge Matrix <-> agent, instancja %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/vibe-matrix-rs/%i.env
+ExecStart=%h/.local/bin/bridge-headless
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

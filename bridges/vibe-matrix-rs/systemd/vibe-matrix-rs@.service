@@ -1,0 +1,31 @@
+# Szablon systemowy (root): jedna instancja na agenta.
+#   env: /etc/vibe-matrix-rs/<agent>.env   (chmod 600!)
+#   start: systemctl enable --now vibe-matrix-rs@vibe
+[Unit]
+Description=vibe-matrix-rs (Rust bridge Matrix <-> agent, instancja %i)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/vibe-matrix-rs/%i.env
+ExecStart=/opt/ai-bridges/bridges/vibe-matrix-rs/target/release/bridge-headless
+Restart=always
+RestartSec=5
+
+# hardening (bez MemoryDenyWriteExecute — vibe/Bun JIT wymaga W+X)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/var/lib/vibe-matrix-rs /root/.vibe /root/.claude /root/.codex /root/.config/antigravity
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+
+[Install]
+WantedBy=multi-user.target
