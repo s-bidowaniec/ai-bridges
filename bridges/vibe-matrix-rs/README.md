@@ -73,3 +73,11 @@ Architektura: agent (vibe/codex/claude/agy) żyje w stałej sesji **tmux**, brid
 - uwaga: modele transcribe nie znają `language=pl` — auto-detect; TTS odpowiada JSON `{"audio_data": base64}`
 - dzwonienie `m.call` (MSC3245/WebRTC) = Faza 6 (wymaga SFU) — na razie tylko voice messages
 - env: `VOICE_FILE`, `UPLOADS_DIR`, `STT_MODEL`, `TTS_MODEL`, `TTS_VOICE`
+
+## v7 — wątki + instalacja na PC (tryb "w aucie")
+- odpowiedzi bota (tekst i voice) lecą jako **wątek** (`m.thread`) do wiadomości użytkownika
+- `/voice new` — reset konwersacji głosowej (czyści sesję tmux)
+- `pc-install/` — instalacja na PC (Linux, user systemd): `./pc-install/install.sh`
+  - klonuje repo do ~/ai-bridges, buduje, konfiguruje `~/.config/vibe-matrix-rs/env`, enable'uje `systemd --user`
+  - potem w pokoju: `/voice on` → seria voice messages = ciągła konwersacja z kontekstem (tmux)
+- prawdziwy call `m.call` (WebRTC/MSC3245, answer bota) = Faza 6 (osobny klient WebRTC, np. aiortc w Pythonowym bridge)

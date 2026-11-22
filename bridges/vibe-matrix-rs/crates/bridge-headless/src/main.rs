@@ -46,7 +46,8 @@ const HELP: &str = "🤖 Komendy bridge'a:
 /attach — pokaż ostatnie linie ekranu agenta (capture-pane)
 /stop — zabij sesję tmux agenta
 /voice — status trybu głosowego
-/voice on|off — odpowiadaj głosem (TTS) også na tekstowe wiadomości
+/voice on|off — odpowiadaj głosem (TTS) też na tekstowe
+/voice new — nowa konwersacja głosowa (reset sesji agenta)
 /status — stan bota
 /help — ta lista
 Inne wiadomości (także /model, /think z TUI agenta) lecą do agenta w tmux — kontekst jest pamiętany.";
@@ -293,11 +294,15 @@ async fn handle_event(
                     let _ = save_str(&cfg.voice_file, "off");
                     "✅ Tryb voice OFF — odpowiedzi tekstowe.".to_string()
                 }
-                Some(other) => format!("❓ /voice on|off (podano: {other})"),
+                Some("new") => {
+                    kill_session(cfg, agent);
+                    "🎙️🔃 Nowa konwersacja głosowa — poprzedni kontekst zapomniany.".to_string()
+                }
+                Some(other) => format!("❓ /voice on|off|new (podano: {other})"),
             },
             BotCommand::Help => HELP.to_string(),
         };
-        let sent = client.send_text(&reply).await?;
+        let sent = client.send_text_rel(&reply, Some(thread_rel(&ev.id))).await?;
         tracing::info!(reply_event = %sent, "odpowiedź na komendę");
         client.react(&ev.id, "✅").await.ok();
         return Ok(());
@@ -314,7 +319,7 @@ async fn handle_event(
             } else {
                 clean
             };
-            let sent = send_reply(client, cfg, &reply, *voice_on).await?;
+            let sent = send_reply(client, cfg, &reply, *voice_on, Some(&ev.id)).await?;
             tracing::info!(reply_event = %sent, "wysłano odpowiedź agenta");
             client.react(&ev.id, "✅").await.ok();
         }
@@ -337,19 +342,24 @@ async fn run_agent_tmux(cfg: &Config, agent: &str, prompt: &str) -> Result<Strin
 }
 
 /// Odpowiada na Matrix: głosem (TTS→m.audio) gdy voice_on, inaczej tekstem.
-async fn send_reply(client: &MatrixClient, cfg: &Config, text: &str, voice_on: bool) -> Result<String> {
+fn thread_rel(root: &str) -> serde_json::Value {
+    serde_json::json!({"rel_type": "m.thread", "event_id": root})
+}
+
+async fn send_reply(client: &MatrixClient, cfg: &Config, text: &str, voice_on: bool, thread_root: Option<&str>) -> Result<String> {
+    let rel = thread_root.map(thread_rel);
     if voice_on && std::env::var("MISTRAL_API_KEY").is_ok() {
         match tts(cfg, text).await {
             Ok((bytes, dur)) => {
                 let mxc = client.upload_media(&bytes, "reply.opus", "audio/ogg").await?;
                 let wf = pseudo_waveform(text.len());
                 let body = format!("🎙️ {}", safe_truncate(text, 200));
-                return client.send_audio(&body, &mxc, "audio/ogg", bytes.len(), dur, &wf).await;
+                return client.send_audio_rel(&body, &mxc, "audio/ogg", bytes.len(), dur, &wf, rel).await;
             }
             Err(e) => tracing::warn!("TTS nieudane, wysyłam tekst: {e:#}"),
         }
     }
-    client.send_text(text).await
+    client.send_text_rel(text, rel).await
 }
 
 /// m.audio -> download -> STT -> agent (tmux) -> odpowiedź (głosem jeśli voice_on).
@@ -406,7 +416,7 @@ async fn handle_voice(
             } else {
                 clean
             };
-            let sent = send_reply(client, cfg, &reply, *voice_on).await?;
+            let sent = send_reply(client, cfg, &reply, *voice_on, Some(&ev.id)).await?;
             tracing::info!(reply_event = %sent, "wysłano odpowiedź (voice)");
             client.react(&ev.id, "✅").await.ok();
         }
@@ -496,6 +506,7 @@ mod tests {
         assert_eq!(parse_command("/status"), Some(BotCommand::Status));
         assert_eq!(parse_command("/voice on"), Some(BotCommand::Voice(Some("on".to_string()))));
         assert_eq!(parse_command("/voice"), Some(BotCommand::Voice(None)));
+        assert_eq!(parse_command("/voice new"), Some(BotCommand::Voice(Some("new".to_string()))));
         assert_eq!(parse_command("/help"), Some(BotCommand::Help));
         // komendy agenta (NIE bridge'a) -> None = lecą do tmuxa
         assert_eq!(parse_command("/model mistral-large-latest"), None);

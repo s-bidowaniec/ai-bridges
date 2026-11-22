@@ -1,0 +1,23 @@
+[Unit]
+Description=vibe-matrix-rs bridge (Matrix room <-> tmux agent, voice)
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/vibe-matrix-rs/env
+WorkingDirectory=%h/ai-bridges/bridges/vibe-matrix-rs
+ExecStart=%h/ai-bridges/bridges/vibe-matrix-rs/target/release/bridge-headless
+Restart=always
+RestartSec=5
+
+# hardening (user-level)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/vibe-matrix-rs %h/.config/vibe-matrix-rs %h/.vibe %h/.cache %h/ai-bridges
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=default.target

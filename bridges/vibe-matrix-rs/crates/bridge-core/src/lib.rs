@@ -120,6 +120,11 @@ impl MatrixClient {
     }
 
     pub async fn send_text(&self, body: &str) -> Result<String> {
+        self.send_text_rel(body, None).await
+    }
+
+    /// send_text z opcjonalnym m.relates_to (np. wątek m.thread).
+    pub async fn send_text_rel(&self, body: &str, rel: Option<serde_json::Value>) -> Result<String> {
         let txn = format!("rs{}", now_nanos());
         let url = format!(
             "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
@@ -127,9 +132,13 @@ impl MatrixClient {
             enc(&self.room_id),
             enc(&txn)
         );
+        let mut content = serde_json::json!({"msgtype": "m.text", "body": body});
+        if let Some(r) = rel {
+            content["m.relates_to"] = r;
+        }
         let resp = self
             .authed(self.http.put(&url))
-            .json(&serde_json::json!({"msgtype": "m.text", "body": body}))
+            .json(&content)
             .send()
             .await
             .context("send_text: send")?;
@@ -226,7 +235,7 @@ impl MatrixClient {
     }
 
     /// Wysyła voice message (m.audio + org.matrix.msc3245.voice).
-    pub async fn send_audio(&self, body: &str, mxc: &str, mime: &str, size: usize, duration_ms: u32, waveform: &[u32]) -> Result<String> {
+    pub async fn send_audio_rel(&self, body: &str, mxc: &str, mime: &str, size: usize, duration_ms: u32, waveform: &[u32], rel: Option<serde_json::Value>) -> Result<String> {
         let txn = format!("au{}", now_nanos());
         let url = format!(
             "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
@@ -234,7 +243,7 @@ impl MatrixClient {
             enc(&self.room_id),
             enc(&txn)
         );
-        let content = serde_json::json!({
+        let mut content = serde_json::json!({
             "msgtype": "m.audio",
             "body": body,
             "url": mxc,
@@ -242,6 +251,9 @@ impl MatrixClient {
             "org.matrix.msc3245.voice": true,
             "org.matrix.msc1767.audio": [{ "waveform": waveform, "duration": duration_ms }],
         });
+        if let Some(r) = rel {
+            content["m.relates_to"] = r;
+        }
         let resp = self
             .authed(self.http.put(&url))
             .json(&content)
@@ -255,5 +267,9 @@ impl MatrixClient {
         }
         let v: serde_json::Value = serde_json::from_str(&body)?;
         Ok(v["event_id"].as_str().unwrap_or("").to_string())
+    }
+
+    pub async fn send_audio(&self, body: &str, mxc: &str, mime: &str, size: usize, duration_ms: u32, waveform: &[u32]) -> Result<String> {
+        self.send_audio_rel(body, mxc, mime, size, duration_ms, waveform, None).await
     }
 }
