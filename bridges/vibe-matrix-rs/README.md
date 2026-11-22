@@ -49,3 +49,9 @@ journalctl -u vibe-matrix-rs -f
 - `/status` — pokój, sesja, model, think, liczba seen, uptime
 - `/help` — lista komend
 - nieznane `/coś` → odpowiedź „nieznana komenda” (NIE leci do agenta)
+
+## /provider (v4)
+- `/provider` — pokaż aktualnego providera
+- `/provider <mistral|openai|anthropic|google>` — przełącza providera: do subprocessa vibe leci tylko odpowiedni klucz (`MISTRAL_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`), zapis w `PROVIDER_FILE`
+- brak klucza w env bota → komunikat ⚠️ (dodaj do `/etc/vibe-matrix-rs.env`, chmod 600) i błąd przy runie
+- bez `/provider` = backward-compat: wszystkie klucze z `VIBE_ENV_KEYS`

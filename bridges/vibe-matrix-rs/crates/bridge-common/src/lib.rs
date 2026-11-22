@@ -18,6 +18,7 @@ pub struct Config {
     pub session_file: String,
     pub model_file: String,
     pub think_file: String,
+    pub provider_file: String,
     pub vibe_workdir: String,
     pub vibe_env_keys: Vec<String>,
 }
@@ -44,6 +45,7 @@ impl Config {
             session_file: std::env::var("SESSION_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/session.txt".to_string()),
             model_file: std::env::var("MODEL_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/model.txt".to_string()),
             think_file: std::env::var("THINK_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/think.txt".to_string()),
+            provider_file: std::env::var("PROVIDER_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/provider.txt".to_string()),
             vibe_workdir: std::env::var("VIBE_WORKDIR").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/vibe-work".to_string()),
             vibe_env_keys: vibe_env_keys.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
         })
@@ -109,6 +111,17 @@ pub fn save_str(path: &str, val: &str) -> Result<()> {
 /// Usuwa plik stanu (np. session.txt przy /new).
 pub fn remove_state_file(path: &str) {
     let _ = std::fs::remove_file(path);
+}
+
+/// Znani providerzy vibe: nazwa -> (env key z API key, domyślny model).
+pub fn provider_env_key(provider: &str) -> Option<(&'static str, &'static str)> {
+    match provider.to_ascii_lowercase().as_str() {
+        "mistral" => Some(("MISTRAL_API_KEY", "mistral-large-latest")),
+        "openai" => Some(("OPENAI_API_KEY", "gpt-5")),
+        "anthropic" | "claude" => Some(("ANTHROPIC_API_KEY", "claude-sonnet-4-5")),
+        "google" | "gemini" => Some(("GEMINI_API_KEY", "gemini-3-pro-preview")),
+        _ => None,
+    }
 }
 
 /// Bezpieczne obcięcie do `max` bajtów na granicy znaku UTF-8 (nie panikuje przy emoji/PL znakach).

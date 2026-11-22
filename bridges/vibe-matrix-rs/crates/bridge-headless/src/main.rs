@@ -3,8 +3,8 @@
 //! Sesja vibe kontynuowana między wiadomościami (`--resume`), żeby nie tracić kontekstu.
 use anyhow::{Context, Result};
 use bridge_common::{
-    clean_ansi, load_seen, load_str_opt, remove_state_file, safe_truncate, save_seen, save_str,
-    Config,
+    clean_ansi, load_seen, load_str_opt, provider_env_key, remove_state_file, safe_truncate,
+    save_seen, save_str, Config,
 };
 use bridge_core::{Event, MatrixClient};
 use std::collections::HashSet;
@@ -17,6 +17,7 @@ enum BotCommand {
     New,
     Model(Option<String>),
     Think(Option<String>),
+    Provider(Option<String>),
     Status,
     Help,
     Unknown(String),
@@ -35,6 +36,7 @@ fn parse_command(body: &str) -> Option<BotCommand> {
         "/new" => BotCommand::New,
         "/model" => BotCommand::Model(arg.map(|s| s.to_string())),
         "/think" => BotCommand::Think(arg.map(|s| s.to_string())),
+        "/provider" => BotCommand::Provider(arg.map(|s| s.to_string())),
         "/status" => BotCommand::Status,
         "/help" | "/start" => BotCommand::Help,
         other => BotCommand::Unknown(other.to_string()),
@@ -47,6 +49,8 @@ const HELP: &str = "🤖 Komendy bota:
 /model <nazwa> — ustaw model (np. /model mistral-large-latest)
 /think — pokaż poziom myślenia
 /think <off|low|medium|high|xhigh|max> — ustaw thinking (działa od nowej sesji)
+/provider — pokaż aktualnego providera
+/provider <mistral|openai|anthropic|google> — przełącz providera (i klucz API)
 /status — stan bota (pokój, sesja, model, seen)
 /help — ta lista
 Każda inna wiadomość leci do agenta vibe (sesja jest pamiętana między wiadomościami).";
@@ -64,6 +68,7 @@ async fn main() -> Result<()> {
     let mut session: Option<String> = load_str_opt(&cfg.session_file);
     let mut model: Option<String> = load_str_opt(&cfg.model_file);
     let mut think: Option<String> = load_str_opt(&cfg.think_file);
+    let mut provider: Option<String> = load_str_opt(&cfg.provider_file);
     let mut since: Option<String> = None;
     let started = Instant::now();
 
@@ -75,7 +80,7 @@ async fn main() -> Result<()> {
                 if let Some(room) = resp.rooms.join.get(&cfg.room_id) {
                     for ev in &room.timeline.events {
                         if let Err(e) = handle_event(
-                            &cfg, &client, ev, &mut seen, &mut session, &mut model, &mut think,
+                            &cfg, &client, ev, &mut seen, &mut session, &mut model, &mut think, &mut provider,
                             started,
                         )
                         .await
@@ -105,6 +110,7 @@ async fn handle_event(
     session: &mut Option<String>,
     model: &mut Option<String>,
     think: &mut Option<String>,
+    provider: &mut Option<String>,
     started: Instant,
 ) -> Result<()> {
     if ev.kind != "m.room.message" || ev.content.msgtype != "m.text" {
@@ -152,13 +158,33 @@ async fn handle_event(
                     format!("✅ Thinking ustawiony na `{t}` (vibe применяет przy nowej sesji; zrób /new żeby wymusić)")
                 }
             },
+            BotCommand::Provider(arg) => match arg {
+                None => format!("🔌 Aktualny provider: {}", provider.as_deref().unwrap_or("(domyślny — wszystkie klucze z VIBE_ENV_KEYS)")),
+                Some(p) => {
+                    let pl = p.to_ascii_lowercase();
+                    match provider_env_key(&pl) {
+                        None => format!("❓ Nieznany provider `{p}`. Dostępni: mistral, openai, anthropic, google"),
+                        Some((env_key, default_model)) => {
+                            let has_key = std::env::var(env_key).is_ok();
+                            *provider = Some(pl.clone());
+                            let _ = save_str(&cfg.provider_file, &pl);
+                            if has_key {
+                                format!("✅ Provider `{pl}` (klucz {env_key} OK). Domyślny model: `{default_model}` — ustaw /model jeśli chcesz inny.")
+                            } else {
+                                format!("⚠️ Provider `{pl}` ustawiony, ale brak zmiennej {env_key} w env bota! Dodaj do /etc/vibe-matrix-rs.env i zrestartuj. Domyślny model: `{default_model}`")
+                            }
+                        }
+                    }
+                }
+            },
             BotCommand::Status => {
                 let sess = session.as_deref().map(|s| &s[..s.len().min(8)]).unwrap_or("(brak)");
                 format!(
-                    "📊 Status:\n• pokój: {}\n• homeserver: {}\n• sesja vibe: {}…\n• model: {}\n• think: {}\n• przetworzone eventy (seen): {}\n• uptime: {:?}",
+                    "📊 Status:\n• pokój: {}\n• homeserver: {}\n• sesja vibe: {}…\n• provider: {}\n• model: {}\n• think: {}\n• przetworzone eventy (seen): {}\n• uptime: {:?}",
                     cfg.room_id,
                     cfg.homeserver,
                     sess,
+                    provider.as_deref().unwrap_or("(domyślny)"),
                     model.as_deref().unwrap_or("(domyślny)"),
                     think.as_deref().unwrap_or("(domyślny)"),
                     seen.len(),
@@ -174,7 +200,7 @@ async fn handle_event(
         return Ok(());
     }
 
-    match run_vibe(cfg, body, session.as_deref(), model.as_deref(), think.as_deref()).await {
+    match run_vibe(cfg, body, session.as_deref(), model.as_deref(), think.as_deref(), provider.as_deref()).await {
         Ok((sid, text)) => {
             if !sid.is_empty() {
                 *session = Some(sid.clone());
@@ -211,6 +237,7 @@ async fn run_vibe(
     session: Option<&str>,
     model: Option<&str>,
     think: Option<&str>,
+    provider: Option<&str>,
 ) -> Result<(String, String)> {
     let mut cmd = Command::new(&cfg.vibe_cmd);
     cmd.arg("-p").arg(prompt).arg("--yolo").arg("--output").arg("json");
@@ -228,9 +255,24 @@ async fn run_vibe(
         .env("PATH", "/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
         .env("HOME", "/root")
         .env("TERM", "dumb");
-    for key in &cfg.vibe_env_keys {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
+    if let Some(p) = provider {
+        // tryb providera: tylko jego klucz API (whitelist env_clear już zrobiona)
+        if let Some((env_key, _)) = provider_env_key(p) {
+            match std::env::var(env_key) {
+                Ok(v) => {
+                    cmd.env(env_key, v);
+                }
+                Err(_) => {
+                    anyhow::bail!("provider `{p}` wymaga zmiennej {env_key} w env bota (EnvironmentFile)");
+                }
+            }
+        }
+    } else {
+        // backward-compat: wszystkie klucze z whitelisty VIBE_ENV_KEYS
+        for key in &cfg.vibe_env_keys {
+            if let Ok(v) = std::env::var(key) {
+                cmd.env(key, v);
+            }
         }
     }
     cmd.kill_on_drop(true)
@@ -298,6 +340,8 @@ mod tests {
             Some(BotCommand::Model(Some("mistral-large-latest".to_string())))
         );
         assert_eq!(parse_command("/think high"), Some(BotCommand::Think(Some("high".to_string()))));
+        assert_eq!(parse_command("/provider"), Some(BotCommand::Provider(None)));
+        assert_eq!(parse_command("/provider openai"), Some(BotCommand::Provider(Some("openai".to_string()))));
         assert_eq!(parse_command("/status"), Some(BotCommand::Status));
         assert_eq!(parse_command("/help"), Some(BotCommand::Help));
         assert_eq!(parse_command("/foobar x"), Some(BotCommand::Unknown("/foobar".to_string())));
