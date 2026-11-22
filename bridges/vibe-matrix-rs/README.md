@@ -55,3 +55,12 @@ journalctl -u vibe-matrix-rs -f
 - `/provider <mistral|openai|anthropic|google>` — przełącza providera: do subprocessa vibe leci tylko odpowiedni klucz (`MISTRAL_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`), zapis w `PROVIDER_FILE`
 - brak klucza w env bota → komunikat ⚠️ (dodaj do `/etc/vibe-matrix-rs.env`, chmod 600) i błąd przy runie
 - bez `/provider` = backward-compat: wszystkie klucze z `VIBE_ENV_KEYS`
+
+## v5 — terminalowe "tuxy" (bez kluczy API, bez --resume)
+Architektura: agent (vibe/codex/claude/agy) żyje w stałej sesji **tmux**, bridge robi tylko `send-keys` + `capture-pane`.
+- sesja tmux: `<TMUX_PREFIX>-<agent>` (default `vibe-matrix-rs-vibe`), workdir `VIBE_WORKDIR`
+- odpowiedź wykrywana przez poll `capture-pane` co 2s (koniec = 3 próbki bez zmian, max `VIBE_TIMEOUT_SECS`)
+- komendy bridge'a: `/new [agent]`, `/agent <vibe|codex|claude|agy>`, `/attach` (capture ekranu), `/stop`, `/status`, `/help`
+- wszystkie inne wiadomości (także `/model`, `/think` TUI agenta) lecą prosto do tmuxa — kontekst pamięta agent
+- env: `AGENT_FILE`, `TMUX_PREFIX`, `VIBE_WORKDIR` (reszta jak wcześniej)
+- uwaga: `agy` wymaga OAuth login na hoście (interaktywnie), inaczej sesja tmux od razu pada
