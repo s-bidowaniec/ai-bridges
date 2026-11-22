@@ -1,0 +1,42 @@
+[mesh]
+max_depth = 2
+default_cooldown_secs = 300
+state_db = ".octomesh/state.db"
+python_runner = "uv"
+python_runner_args = ["run", "--project", "adapters", "python", "-m", "octomesh_adapters.runner"]
+
+[roles]
+coder = ["mock-fast", "mock-safe"]
+reviewer = ["mock-safe", "claude"]
+production_coder = ["claude", "codex", "vibe"]
+
+[peers.mock-fast]
+adapter = "mock"
+command = "mock"
+timeout_secs = 10
+cooldown_secs = 120
+extra_args = ["--simulate-rate-limit-on-keyword"]
+
+[peers.mock-safe]
+adapter = "mock"
+command = "mock"
+timeout_secs = 10
+cooldown_secs = 60
+
+[peers.claude]
+adapter = "claude"
+command = "claude"
+timeout_secs = 180
+cooldown_secs = 300
+
+[peers.vibe]
+adapter = "vibe"
+command = "vibe"
+timeout_secs = 180
+cooldown_secs = 180
+
+[peers.codex]
+adapter = "codex"
+command = "codex"
+timeout_secs = 180
+cooldown_secs = 300

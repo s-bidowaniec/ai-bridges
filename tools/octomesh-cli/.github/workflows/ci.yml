@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust (fmt, check, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Rust unit & integration tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/adapters
+        run: cargo test --workspace
+
+  python:
+    name: Python Adapters (ruff, pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: adapters
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: uv sync --dev
+      - name: Lint with ruff
+        run: uv run ruff check .
+      - name: Run pytest
+        run: uv run pytest -v
