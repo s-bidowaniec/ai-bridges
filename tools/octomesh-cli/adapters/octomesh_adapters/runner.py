@@ -5,6 +5,7 @@ import sys
 import time
 
 from .base import AdapterRequest, AdapterResponse, BaseAdapter, ErrorCode
+from .agy import AgyAdapter
 from .claude import ClaudeAdapter
 from .codex import CodexAdapter
 from .mock import MockAdapter
@@ -15,6 +16,7 @@ ADAPTER_REGISTRY: dict[str, type[BaseAdapter]] = {
     "claude": ClaudeAdapter,
     "vibe": VibeAdapter,
     "codex": CodexAdapter,
+    "agy": AgyAdapter,
 }
 
 
