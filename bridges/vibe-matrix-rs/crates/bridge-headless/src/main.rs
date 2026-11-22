@@ -14,6 +14,7 @@ enum BotCommand {
     Agent(String),
     Attach,
     Stop,
+    Voice(Option<String>),
     Status,
     Help,
 }
@@ -32,6 +33,7 @@ fn parse_command(body: &str) -> Option<BotCommand> {
         "/agent" => arg.map(|a| BotCommand::Agent(a.to_string())).unwrap_or(BotCommand::Help),
         "/attach" => BotCommand::Attach,
         "/stop" => BotCommand::Stop,
+        "/voice" => BotCommand::Voice(arg.map(|s| s.to_string())),
         "/status" => BotCommand::Status,
         "/help" | "/start" => BotCommand::Help,
         _ => return None, // nie nasza komenda -> do tmuxa
@@ -43,6 +45,8 @@ const HELP: &str = "🤖 Komendy bridge'a:
 /agent <vibe|codex|claude|agy> — przełącz agenta (nowa sesja tmux przy następnej wiadomości)
 /attach — pokaż ostatnie linie ekranu agenta (capture-pane)
 /stop — zabij sesję tmux agenta
+/voice — status trybu głosowego
+/voice on|off — odpowiadaj głosem (TTS) også na tekstowe wiadomości
 /status — stan bota
 /help — ta lista
 Inne wiadomości (także /model, /think z TUI agenta) lecą do agenta w tmux — kontekst jest pamiętany.";
@@ -162,6 +166,7 @@ async fn main() -> Result<()> {
     let client = MatrixClient::new(&cfg.homeserver, &cfg.token, &cfg.room_id)?;
     let mut seen: HashSet<String> = load_seen(&cfg.state_file);
     let mut agent: String = load_str_opt(&cfg.agent_file).unwrap_or_else(|| "vibe".to_string());
+    let mut voice_on: bool = load_str_opt(&cfg.voice_file).map(|v| v == "on").unwrap_or(false);
     let mut since: Option<String> = None;
     let started = Instant::now();
 
@@ -171,7 +176,7 @@ async fn main() -> Result<()> {
                 since = Some(resp.next_batch.clone());
                 if let Some(room) = resp.rooms.join.get(&cfg.room_id) {
                     for ev in &room.timeline.events {
-                        if let Err(e) = handle_event(&cfg, &client, ev, &mut seen, &mut agent, started).await {
+                        if let Err(e) = handle_event(&cfg, &client, ev, &mut seen, &mut agent, &mut voice_on, started).await {
                             tracing::error!(event = %ev.id, "błąd obsługi eventu: {e:#}");
                         }
                     }
@@ -194,9 +199,16 @@ async fn handle_event(
     ev: &Event,
     seen: &mut HashSet<String>,
     agent: &mut String,
+    voice_on: &mut bool,
     started: Instant,
 ) -> Result<()> {
-    if ev.kind != "m.room.message" || ev.content.msgtype != "m.text" {
+    if ev.kind != "m.room.message" {
+        return Ok(());
+    }
+    if ev.content.msgtype == "m.audio" {
+        return handle_voice(cfg, client, ev, seen, agent, voice_on).await;
+    }
+    if ev.content.msgtype != "m.text" {
         return Ok(());
     }
     if ev.sender == cfg.bot_user_id {
@@ -265,10 +277,24 @@ async fn handle_event(
                 let s = tmux_session(cfg, agent);
                 let alive = tmux_has_session(&s);
                 format!(
-                    "📊 Status:\n• pokój: {}\n• agent: {agent} (tmux `{s}`, alive={alive})\n• homeserver: {}\n• seen: {} eventów\n• uptime: {:?}",
-                    cfg.room_id, cfg.homeserver, seen.len(), started.elapsed()
+                    "📊 Status:\n• pokój: {}\n• agent: {agent} (tmux `{s}`, alive={alive})\n• voice: {}\n• homeserver: {}\n• seen: {} eventów\n• uptime: {:?}",
+                    cfg.room_id, if *voice_on { "ON" } else { "OFF" }, cfg.homeserver, seen.len(), started.elapsed()
                 )
             }
+            BotCommand::Voice(arg) => match arg.as_deref() {
+                None => format!("🎙️ Tryb voice: {}", if *voice_on { "ON (odpowiedzi głosem)" } else { "OFF" }),
+                Some("on") => {
+                    *voice_on = true;
+                    let _ = save_str(&cfg.voice_file, "on");
+                    "✅ Tryb voice ON — będę odpowiadał głosem (TTS).".to_string()
+                }
+                Some("off") => {
+                    *voice_on = false;
+                    let _ = save_str(&cfg.voice_file, "off");
+                    "✅ Tryb voice OFF — odpowiedzi tekstowe.".to_string()
+                }
+                Some(other) => format!("❓ /voice on|off (podano: {other})"),
+            },
             BotCommand::Help => HELP.to_string(),
         };
         let sent = client.send_text(&reply).await?;
@@ -288,7 +314,7 @@ async fn handle_event(
             } else {
                 clean
             };
-            let sent = client.send_text(&reply).await?;
+            let sent = send_reply(client, cfg, &reply, *voice_on).await?;
             tracing::info!(reply_event = %sent, "wysłano odpowiedź agenta");
             client.react(&ev.id, "✅").await.ok();
         }
@@ -310,6 +336,149 @@ async fn run_agent_tmux(cfg: &Config, agent: &str, prompt: &str) -> Result<Strin
     Ok(reply)
 }
 
+/// Odpowiada na Matrix: głosem (TTS→m.audio) gdy voice_on, inaczej tekstem.
+async fn send_reply(client: &MatrixClient, cfg: &Config, text: &str, voice_on: bool) -> Result<String> {
+    if voice_on && std::env::var("MISTRAL_API_KEY").is_ok() {
+        match tts(cfg, text).await {
+            Ok((bytes, dur)) => {
+                let mxc = client.upload_media(&bytes, "reply.opus", "audio/ogg").await?;
+                let wf = pseudo_waveform(text.len());
+                let body = format!("🎙️ {}", safe_truncate(text, 200));
+                return client.send_audio(&body, &mxc, "audio/ogg", bytes.len(), dur, &wf).await;
+            }
+            Err(e) => tracing::warn!("TTS nieudane, wysyłam tekst: {e:#}"),
+        }
+    }
+    client.send_text(text).await
+}
+
+/// m.audio -> download -> STT -> agent (tmux) -> odpowiedź (głosem jeśli voice_on).
+async fn handle_voice(
+    cfg: &Config,
+    client: &MatrixClient,
+    ev: &Event,
+    seen: &mut HashSet<String>,
+    agent: &mut String,
+    voice_on: &mut bool,
+) -> Result<()> {
+    if ev.content.file.is_some() {
+        client.send_text("⚠️ zaszyfrowane media (E2EE) nie są obsługiwane w MVP").await.ok();
+        return Ok(());
+    }
+    let mxc = ev.content.url.clone().context("m.audio bez url")?;
+    if !seen.insert(ev.id.clone()) {
+        return Ok(());
+    }
+    client.react(&ev.id, "👀").await.ok();
+    let (fname, bytes, mime) = match client.download_mxc(&mxc).await {
+        Ok(t) => t,
+        Err(e) => {
+            client.send_text(&format!("⚠️ nie pobrałem audio: {e:#}")).await.ok();
+            return Ok(());
+        }
+    };
+    std::fs::create_dir_all(&cfg.uploads_dir).ok();
+    let safe_name: String = fname.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }).collect();
+    let path = format!("{}/{}", cfg.uploads_dir, safe_name);
+    let _ = std::fs::write(&path, &bytes);
+
+    let text = match stt(cfg, &bytes, &safe_name, &mime).await {
+        Ok(t) if !t.trim().is_empty() => t,
+        Ok(_) => {
+            client.send_text("🎙️ (nie rozpoznałem mowy)").await.ok();
+            return Ok(());
+        }
+        Err(e) => {
+            client.send_text(&format!("⚠️ STT błąd: {e:#}")).await.ok();
+            client.react(&ev.id, "❌").await.ok();
+            return Ok(());
+        }
+    };
+    tracing::info!(event = %ev.id, len = text.len(), "STT: {text:.80}");
+    let prompt = format!("[voice message od {}]: {}", ev.sender, text);
+    match run_agent_tmux(cfg, agent, &prompt).await {
+        Ok(reply) => {
+            let clean = clean_ansi(&reply);
+            let reply = if clean.is_empty() {
+                "(agent nic nie odpowiedział — /attach)".to_string()
+            } else if clean.len() > 3800 {
+                format!("{}…", safe_truncate(&clean, 3800))
+            } else {
+                clean
+            };
+            let sent = send_reply(client, cfg, &reply, *voice_on).await?;
+            tracing::info!(reply_event = %sent, "wysłano odpowiedź (voice)");
+            client.react(&ev.id, "✅").await.ok();
+        }
+        Err(e) => {
+            client.send_text(&format!("⚠️ błąd agenta: {e:#}")).await.ok();
+            client.react(&ev.id, "❌").await.ok();
+        }
+    }
+    Ok(())
+}
+
+/// STT przez Mistral /v1/audio/transcriptions.
+async fn stt(cfg: &Config, audio: &[u8], filename: &str, mime: &str) -> Result<String> {
+    let key = std::env::var("MISTRAL_API_KEY").context("brak MISTRAL_API_KEY — voice niedostępne")?;
+    let http = reqwest::Client::new();
+    let part = reqwest::multipart::Part::bytes(audio.to_vec())
+        .file_name(filename.to_string())
+        .mime_str(mime)
+        .context("mime")?;
+    let form = reqwest::multipart::Form::new()
+        .text("model", cfg.stt_model.clone())
+        .part("file", part); // bez language = auto-detect (pl nie jest na liście modeli transcribe)
+    let resp = http
+        .post("https://api.mistral.ai/v1/audio/transcriptions")
+        .bearer_auth(key)
+        .multipart(form)
+        .send()
+        .await
+        .context("STT send")?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await.context("STT json")?;
+    if !status.is_success() {
+        anyhow::bail!("STT HTTP {status}: {v}");
+    }
+    Ok(v["text"].as_str().unwrap_or("").to_string())
+}
+
+/// TTS przez Mistral /v1/audio/speech → (opus bytes, duration_ms).
+async fn tts(cfg: &Config, text: &str) -> Result<(Vec<u8>, u32)> {
+    let key = std::env::var("MISTRAL_API_KEY").context("brak MISTRAL_API_KEY")?;
+    let http = reqwest::Client::new();
+    let body = serde_json::json!({
+        "model": cfg.tts_model,
+        "input": text,
+        "voice": cfg.tts_voice,
+        "response_format": "opus",
+    });
+    let resp = http
+        .post("https://api.mistral.ai/v1/audio/speech")
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await
+        .context("TTS send")?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await.context("TTS json")?;
+    if !status.is_success() {
+        anyhow::bail!("TTS HTTP {status}: {v}");
+    }
+    // Mistral zwraca JSON {"audio_data": "<base64 OGG/Opus>"}
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let b64 = v["audio_data"].as_str().context("TTS: brak audio_data w odpowiedzi")?;
+    let bytes = STANDARD.decode(b64).context("TTS: base64 decode")?;
+    let duration_ms = ((text.split_whitespace().count() as f64 / 150.0) * 60_000.0) as u32;
+    Ok((bytes, duration_ms.max(500)))
+}
+
+/// Prosta pseudo-fala (sinusoida) do voice message.
+fn pseudo_waveform(_text_len: usize) -> Vec<u32> {
+    (0..40).map(|i| (300.0 + (i as f32 * 0.7).sin() * 200.0) as u32).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +494,8 @@ mod tests {
         assert_eq!(parse_command("/attach"), Some(BotCommand::Attach));
         assert_eq!(parse_command("/stop"), Some(BotCommand::Stop));
         assert_eq!(parse_command("/status"), Some(BotCommand::Status));
+        assert_eq!(parse_command("/voice on"), Some(BotCommand::Voice(Some("on".to_string()))));
+        assert_eq!(parse_command("/voice"), Some(BotCommand::Voice(None)));
         assert_eq!(parse_command("/help"), Some(BotCommand::Help));
         // komendy agenta (NIE bridge'a) -> None = lecą do tmuxa
         assert_eq!(parse_command("/model mistral-large-latest"), None);

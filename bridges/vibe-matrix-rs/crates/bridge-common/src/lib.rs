@@ -19,6 +19,11 @@ pub struct Config {
     pub agent_file: String,
     pub tmux_prefix: String,
     pub vibe_workdir: String,
+    pub voice_file: String,
+    pub uploads_dir: String,
+    pub stt_model: String,
+    pub tts_model: String,
+    pub tts_voice: String,
     pub vibe_env_keys: Vec<String>,
 }
 
@@ -44,6 +49,11 @@ impl Config {
             session_file: std::env::var("SESSION_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/session.txt".to_string()),
             agent_file: std::env::var("AGENT_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/agent.txt".to_string()),
             tmux_prefix: std::env::var("TMUX_PREFIX").unwrap_or_else(|_| "vibe-matrix-rs".to_string()),
+            voice_file: std::env::var("VOICE_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/voice.txt".to_string()),
+            uploads_dir: std::env::var("UPLOADS_DIR").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/uploads".to_string()),
+            stt_model: std::env::var("STT_MODEL").unwrap_or_else(|_| "voxtral-mini-latest".to_string()),
+            tts_model: std::env::var("TTS_MODEL").unwrap_or_else(|_| "voxtral-mini-tts-latest".to_string()),
+            tts_voice: std::env::var("TTS_VOICE").unwrap_or_else(|_| "gb_jane_neutral".to_string()),
             vibe_workdir: std::env::var("VIBE_WORKDIR").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/vibe-work".to_string()),
             vibe_env_keys: vibe_env_keys.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
         })

@@ -61,6 +61,12 @@ pub struct EventContent {
     pub body: String,
     #[serde(default)]
     pub msgtype: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub file: Option<serde_json::Value>,
+    #[serde(default)]
+    pub info: Option<serde_json::Value>,
 }
 
 fn enc(s: &str) -> String {
@@ -137,7 +143,6 @@ impl MatrixClient {
     }
 
     pub async fn react(&self, event_id: &str, emoji: &str) -> Result<()> {
-        // Uwaga: w tym buildzie Synapse nie ma osobnego endpointu /events/{id}/reactions/...,
         // reakcję wysyłamy jako zwykły event m.reaction; key MUSI być wewnątrz m.relates_to.
         let txn = format!("rx{}", now_nanos());
         let url = format!(
@@ -159,5 +164,96 @@ impl MatrixClient {
             tracing::warn!(emoji, event_id, "reakcja nieudana: {}", &b[..b.len().min(200)]);
         }
         Ok(())
+    }
+
+    /// Pobiera media z mxc://server/media_id. Zwraca (filename, bytes, mime).
+    pub async fn download_mxc(&self, mxc: &str) -> Result<(String, Vec<u8>, String)> {
+        let rest = mxc.strip_prefix("mxc://").context("zły mxc (brak mxc://)")?;
+        let (server, media_id) = rest.split_once('/').context("zły mxc (brak /)")?;
+        let url = format!(
+            "{}/_matrix/media/v3/download/{}/{}",
+            self.base,
+            enc(server),
+            enc(media_id)
+        );
+        let resp = self.authed(self.http.get(&url)).send().await.context("download: send")?;
+        let status = resp.status();
+        let mime = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .split(';')
+            .next()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let cd = resp
+            .headers()
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = resp.bytes().await.context("download: body")?.to_vec();
+        if !status.is_success() {
+            anyhow::bail!("download: HTTP {status} ({} bajtów)", bytes.len());
+        }
+        let filename = cd
+            .split("filename=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{media_id}.ogg"));
+        Ok((filename, bytes, mime))
+    }
+
+    /// Upload media na homeserver. Zwraca mxc://...
+    pub async fn upload_media(&self, bytes: &[u8], filename: &str, mime: &str) -> Result<String> {
+        let url = format!("{}/_matrix/media/v3/upload?filename={}", self.base, enc(filename));
+        let resp = self
+            .authed(self.http.post(&url))
+            .header("content-type", mime)
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .context("upload: send")?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("upload: HTTP {status}: {}", &body[..body.len().min(300)]);
+        }
+        let v: serde_json::Value = serde_json::from_str(&body)?;
+        Ok(v["content_uri"].as_str().context("upload: brak content_uri")?.to_string())
+    }
+
+    /// Wysyła voice message (m.audio + org.matrix.msc3245.voice).
+    pub async fn send_audio(&self, body: &str, mxc: &str, mime: &str, size: usize, duration_ms: u32, waveform: &[u32]) -> Result<String> {
+        let txn = format!("au{}", now_nanos());
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            self.base,
+            enc(&self.room_id),
+            enc(&txn)
+        );
+        let content = serde_json::json!({
+            "msgtype": "m.audio",
+            "body": body,
+            "url": mxc,
+            "info": { "mimetype": mime, "size": size, "duration": duration_ms },
+            "org.matrix.msc3245.voice": true,
+            "org.matrix.msc1767.audio": [{ "waveform": waveform, "duration": duration_ms }],
+        });
+        let resp = self
+            .authed(self.http.put(&url))
+            .json(&content)
+            .send()
+            .await
+            .context("send_audio: send")?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("send_audio: HTTP {status}: {}", &body[..body.len().min(300)]);
+        }
+        let v: serde_json::Value = serde_json::from_str(&body)?;
+        Ok(v["event_id"].as_str().unwrap_or("").to_string())
     }
 }

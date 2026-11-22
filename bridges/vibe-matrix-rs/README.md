@@ -64,3 +64,12 @@ Architektura: agent (vibe/codex/claude/agy) żyje w stałej sesji **tmux**, brid
 - wszystkie inne wiadomości (także `/model`, `/think` TUI agenta) lecą prosto do tmuxa — kontekst pamięta agent
 - env: `AGENT_FILE`, `TMUX_PREFIX`, `VIBE_WORKDIR` (reszta jak wcześniej)
 - uwaga: `agy` wymaga OAuth login na hoście (interaktywnie), inaczej sesja tmux od razu pada
+
+## v6 — voice (m.audio ↔ STT/TTS przez Mistral API)
+- wiadomość głosowa (`m.audio`) → download mxc → **STT** (`/v1/audio/transcriptions`, model `voxtral-mini-latest`, auto-language) → tekst → agent w tmux (`[voice message od ...]: ...`) → odpowiedź
+- `/voice on|off` — gdy ON, wszystkie odpowiedzi (też na tekst) idą jako **voice message** (TTS `voxtral-mini-tts-latest` → opus → upload → `m.audio` + `org.matrix.msc3245.voice` + waveform)
+- wymaga `MISTRAL_API_KEY` w env bota (`/etc/vibe-matrix-rs.env`)
+- E2EE media (`content.file`) → komunikat "nieobsługiwane" (MVP)
+- uwaga: modele transcribe nie znają `language=pl` — auto-detect; TTS odpowiada JSON `{"audio_data": base64}`
+- dzwonienie `m.call` (MSC3245/WebRTC) = Faza 6 (wymaga SFU) — na razie tylko voice messages
+- env: `VOICE_FILE`, `UPLOADS_DIR`, `STT_MODEL`, `TTS_MODEL`, `TTS_VOICE`
