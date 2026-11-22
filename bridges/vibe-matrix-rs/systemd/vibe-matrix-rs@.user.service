@@ -2,6 +2,10 @@
 #   env: ~/.config/vibe-matrix-rs/<agent>.env   (chmod 600!)
 #   start: systemctl --user enable --now vibe-matrix-rs@vibe
 # Binarka: ~/.local/bin/bridge-headless (patrz README — sekcja "Instalacja lokalna")
+# UWAGA: w env ustaw też ścieżki stanu pod $HOME, np.:
+#   STATE_FILE=%h/.local/state/vibe-matrix-rs/seen.txt
+#   AGENT_FILE=%h/.local/state/vibe-matrix-rs/agent.txt
+#   VIBE_WORKDIR=%h/.local/state/vibe-matrix-rs/vibe-work
 [Unit]
 Description=vibe-matrix-rs (Rust bridge Matrix <-> agent, instancja %i)
 After=network-online.target
@@ -13,6 +17,22 @@ EnvironmentFile=%h/.config/vibe-matrix-rs/%i.env
 ExecStart=%h/.local/bin/bridge-headless
 Restart=always
 RestartSec=5
+
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/vibe-matrix-rs %h/.vibe %h/.claude %h/.codex %h/.config/antigravity
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+UMask=0077
 
 [Install]
 WantedBy=default.target

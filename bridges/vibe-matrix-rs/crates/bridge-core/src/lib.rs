@@ -1,5 +1,6 @@
 //! bridge-core: minimalny klient Matrix (sync/send/reakcje) przez reqwest + Bearer.
 use anyhow::{Context, Result};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,7 +15,7 @@ fn now_nanos() -> u128 {
 pub struct MatrixClient {
     http: reqwest::Client,
     base: String,
-    token: String,
+    token: SecretString,
     room_id: String,
 }
 
@@ -83,24 +84,27 @@ fn enc(s: &str) -> String {
 }
 
 impl MatrixClient {
-    pub fn new(base: &str, token: &str, room_id: &str) -> Result<Self> {
+    pub fn new(base: &str, token: &SecretString, room_id: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(90))
             .build()?;
         Ok(Self {
             http,
             base: base.trim_end_matches('/').to_string(),
-            token: token.to_string(),
+            token: token.clone(),
             room_id: room_id.to_string(),
         })
     }
 
     fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        req.bearer_auth(&self.token)
+        req.bearer_auth(self.token.expose_secret())
     }
 
     pub async fn sync(&self, since: Option<&str>, timeout_ms: u32) -> Result<SyncResponse> {
-        let mut url = format!("{}/_matrix/client/v3/sync?timeout={}", self.base, timeout_ms);
+        let mut url = format!(
+            "{}/_matrix/client/v3/sync?timeout={}",
+            self.base, timeout_ms
+        );
         if let Some(s) = since {
             url.push_str(&format!("&since={}", enc(s)));
         }
@@ -114,8 +118,7 @@ impl MatrixClient {
         if !status.is_success() {
             anyhow::bail!("sync: HTTP {status}: {}", &body[..body.len().min(300)]);
         }
-        let parsed: SyncResponse =
-            serde_json::from_str(&body).context("sync: parse json")?;
+        let parsed: SyncResponse = serde_json::from_str(&body).context("sync: parse json")?;
         Ok(parsed)
     }
 
@@ -124,7 +127,11 @@ impl MatrixClient {
     }
 
     /// send_text z opcjonalnym m.relates_to (np. wątek m.thread).
-    pub async fn send_text_rel(&self, body: &str, rel: Option<serde_json::Value>) -> Result<String> {
+    pub async fn send_text_rel(
+        &self,
+        body: &str,
+        rel: Option<serde_json::Value>,
+    ) -> Result<String> {
         let txn = format!("rs{}", now_nanos());
         let url = format!(
             "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
@@ -170,25 +177,49 @@ impl MatrixClient {
             .context("react: send")?;
         if !resp.status().is_success() {
             let b = resp.text().await.unwrap_or_default();
-            tracing::warn!(emoji, event_id, "reakcja nieudana: {}", &b[..b.len().min(200)]);
+            tracing::warn!(
+                emoji,
+                event_id,
+                "reakcja nieudana: {}",
+                &b[..b.len().min(200)]
+            );
         }
         Ok(())
     }
 
     /// Pobiera media z mxc://server/media_id. Zwraca (filename, bytes, mime).
     pub async fn download_mxc(&self, mxc: &str) -> Result<(String, Vec<u8>, String)> {
-        let rest = mxc.strip_prefix("mxc://").context("zły mxc (brak mxc://)")?;
+        let rest = mxc
+            .strip_prefix("mxc://")
+            .context("zły mxc (brak mxc://)")?;
         let (server, media_id) = rest.split_once('/').context("zły mxc (brak /)")?;
         // Uwaga: ten Synapse (matrix.owl-post.eu) wystawia tylko legacy v1 — v3 daje 404.
         // Próbujemy v1, fallback v3 (inne serwery).
-        let url_v1 = format!("{}/_matrix/client/v1/media/download/{}/{}", self.base, enc(server), enc(media_id));
-        let url_v3 = format!("{}/_matrix/media/v3/download/{}/{}", self.base, enc(server), enc(media_id));
-        let resp = self.authed(self.http.get(&url_v1)).send().await.context("download: send v1")?;
+        let url_v1 = format!(
+            "{}/_matrix/client/v1/media/download/{}/{}",
+            self.base,
+            enc(server),
+            enc(media_id)
+        );
+        let url_v3 = format!(
+            "{}/_matrix/media/v3/download/{}/{}",
+            self.base,
+            enc(server),
+            enc(media_id)
+        );
+        let resp = self
+            .authed(self.http.get(&url_v1))
+            .send()
+            .await
+            .context("download: send v1")?;
         let resp = if resp.status().is_success() {
             resp
         } else {
             tracing::warn!(mxc, "v1 404, próbuję v3");
-            self.authed(self.http.get(&url_v3)).send().await.context("download: send v3")?
+            self.authed(self.http.get(&url_v3))
+                .send()
+                .await
+                .context("download: send v3")?
         };
         let status = resp.status();
         let mime = resp
@@ -221,7 +252,11 @@ impl MatrixClient {
 
     /// Upload media na homeserver. Zwraca mxc://...
     pub async fn upload_media(&self, bytes: &[u8], filename: &str, mime: &str) -> Result<String> {
-        let url = format!("{}/_matrix/media/v3/upload?filename={}", self.base, enc(filename));
+        let url = format!(
+            "{}/_matrix/media/v3/upload?filename={}",
+            self.base,
+            enc(filename)
+        );
         let resp = self
             .authed(self.http.post(&url))
             .header("content-type", mime)
@@ -235,11 +270,23 @@ impl MatrixClient {
             anyhow::bail!("upload: HTTP {status}: {}", &body[..body.len().min(300)]);
         }
         let v: serde_json::Value = serde_json::from_str(&body)?;
-        Ok(v["content_uri"].as_str().context("upload: brak content_uri")?.to_string())
+        Ok(v["content_uri"]
+            .as_str()
+            .context("upload: brak content_uri")?
+            .to_string())
     }
 
     /// Wysyła voice message (m.audio + org.matrix.msc3245.voice).
-    pub async fn send_audio_rel(&self, body: &str, mxc: &str, mime: &str, size: usize, duration_ms: u32, waveform: &[u32], rel: Option<serde_json::Value>) -> Result<String> {
+    pub async fn send_audio_rel(
+        &self,
+        body: &str,
+        mxc: &str,
+        mime: &str,
+        size: usize,
+        duration_ms: u32,
+        waveform: &[u32],
+        rel: Option<serde_json::Value>,
+    ) -> Result<String> {
         let txn = format!("au{}", now_nanos());
         let url = format!(
             "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
@@ -267,13 +314,25 @@ impl MatrixClient {
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {
-            anyhow::bail!("send_audio: HTTP {status}: {}", &body[..body.len().min(300)]);
+            anyhow::bail!(
+                "send_audio: HTTP {status}: {}",
+                &body[..body.len().min(300)]
+            );
         }
         let v: serde_json::Value = serde_json::from_str(&body)?;
         Ok(v["event_id"].as_str().unwrap_or("").to_string())
     }
 
-    pub async fn send_audio(&self, body: &str, mxc: &str, mime: &str, size: usize, duration_ms: u32, waveform: &[u32]) -> Result<String> {
-        self.send_audio_rel(body, mxc, mime, size, duration_ms, waveform, None).await
+    pub async fn send_audio(
+        &self,
+        body: &str,
+        mxc: &str,
+        mime: &str,
+        size: usize,
+        duration_ms: u32,
+        waveform: &[u32],
+    ) -> Result<String> {
+        self.send_audio_rel(body, mxc, mime, size, duration_ms, waveform, None)
+            .await
     }
 }

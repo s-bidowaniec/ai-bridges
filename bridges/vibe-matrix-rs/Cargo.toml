@@ -12,6 +12,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 regex = "1"
 base64 = "0.22"
+secrecy = "0.10"
 
 [profile.release]
 opt-level = 2

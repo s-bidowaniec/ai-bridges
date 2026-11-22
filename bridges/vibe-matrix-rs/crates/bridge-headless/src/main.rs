@@ -2,9 +2,11 @@
 //! Bez kluczy API pośrednio — agent żyje w tmuxie, my tylko send-keys + capture-pane.
 //! Komendy bota: /new [agent] /agent <n> /attach /stop /status /help; reszta (np. /model) leci do tmuxa.
 use anyhow::{Context, Result};
-use bridge_common::{clean_ansi, load_seen, load_str_opt, safe_truncate, save_seen, save_str, Config};
+use bridge_common::{
+    clean_ansi, load_seen, load_str_opt, safe_truncate, save_seen, save_str, Config,
+};
 use bridge_core::{Event, MatrixClient};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -31,7 +33,9 @@ fn parse_command(body: &str) -> Option<BotCommand> {
     let arg = parts.next();
     Some(match cmd {
         "/new" => BotCommand::New(arg.map(|s| s.to_string())),
-        "/agent" => arg.map(|a| BotCommand::Agent(a.to_string())).unwrap_or(BotCommand::Help),
+        "/agent" => arg
+            .map(|a| BotCommand::Agent(a.to_string()))
+            .unwrap_or(BotCommand::Help),
         "/attach" => BotCommand::Attach,
         "/stop" => BotCommand::Stop,
         "/voice" => BotCommand::Voice(arg.map(|s| s.to_string())),
@@ -53,13 +57,16 @@ const HELP: &str = "🤖 Komendy bridge'a:
 /help — ta lista
 Inne wiadomości (także /model, /think z TUI agenta) lecą do agenta w tmux — kontekst jest pamiętany.";
 
-/// Komenda startowa agenta w tmux.
-fn agent_cmd(agent: &str) -> Option<&'static str> {
+/// Komenda startowa agenta. `agy` jest konfigurowalne przez env AGY_CMD
+/// (default: `agy` z PATH) — bez hardcodowanej ścieżki /root/.
+fn agent_cmd(agent: &str) -> Option<String> {
     match agent.to_ascii_lowercase().as_str() {
-        "vibe" => Some("vibe"),
-        "codex" => Some("codex"),
-        "claude" => Some("claude"),
-        "agy" | "antigravity" => Some("/root/.local/bin/agy"),
+        "vibe" => Some("vibe".to_string()),
+        "codex" => Some("codex".to_string()),
+        "claude" => Some("claude".to_string()),
+        "agy" | "antigravity" => {
+            Some(std::env::var("AGY_CMD").unwrap_or_else(|_| "agy".to_string()))
+        }
         _ => None,
     }
 }
@@ -102,8 +109,17 @@ fn tmux_has_session(session: &str) -> bool {
 fn ensure_session(cfg: &Config, agent: &str) -> Result<String> {
     let session = tmux_session(cfg, agent);
     if !tmux_has_session(&session) {
-        let cmd = agent_cmd(agent).with_context(|| format!("nieznany agent `{agent}` (vibe|codex|claude|agy)"))?;
-        tmux(&["new-session", "-d", "-s", &session, "-c", &cfg.vibe_workdir, cmd])?;
+        let cmd = agent_cmd(agent)
+            .with_context(|| format!("nieznany agent `{agent}` (vibe|codex|claude|agy)"))?;
+        tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            &session,
+            "-c",
+            &cfg.vibe_workdir,
+            cmd.as_str(),
+        ])?;
         // poczekaj aż agent wystartuje
         std::thread::sleep(Duration::from_secs(3));
     }
@@ -175,7 +191,14 @@ async fn main() -> Result<()> {
     }
     let mut seen: HashSet<String> = load_seen(&cfg.state_file);
     let mut agent: String = load_str_opt(&cfg.agent_file).unwrap_or_else(|| "vibe".to_string());
-    let mut voice_on: bool = load_str_opt(&cfg.voice_file).map(|v| v == "on").unwrap_or(false);
+    if agent_cmd(&agent).is_none() {
+        tracing::warn!(agent = %agent, "agent z AGENT_FILE nieznany — reset do `vibe`");
+        agent = "vibe".to_string();
+    }
+    let mut voice_on: bool = load_str_opt(&cfg.voice_file)
+        .map(|v| v == "on")
+        .unwrap_or(false);
+    let mut sender_hits: HashMap<String, VecDeque<Instant>> = HashMap::new();
     let mut since: Option<String> = None;
     let started = Instant::now();
 
@@ -183,15 +206,30 @@ async fn main() -> Result<()> {
         match client.sync(since.as_deref(), cfg.sync_timeout_ms).await {
             Ok(resp) => {
                 since = Some(resp.next_batch.clone());
+                let mut seen_dirty = false;
                 if let Some(room) = resp.rooms.join.get(&cfg.room_id) {
                     for ev in &room.timeline.events {
-                        if let Err(e) = handle_event(&cfg, &client, ev, &mut seen, &mut agent, &mut voice_on, started).await {
+                        if let Err(e) = handle_event(
+                            &cfg,
+                            &client,
+                            ev,
+                            &mut seen,
+                            &mut seen_dirty,
+                            &mut agent,
+                            &mut voice_on,
+                            &mut sender_hits,
+                            started,
+                        )
+                        .await
+                        {
                             tracing::error!(event = %ev.id, "błąd obsługi eventu: {e:#}");
                         }
                     }
                 }
-                if let Err(e) = save_seen(&cfg.state_file, &seen) {
-                    tracing::warn!("nie udało się zapisać stanu: {e:#}");
+                if seen_dirty {
+                    if let Err(e) = save_seen(&cfg.state_file, &seen) {
+                        tracing::warn!("nie udało się zapisać stanu: {e:#}");
+                    }
                 }
             }
             Err(e) => {
@@ -202,22 +240,22 @@ async fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_event(
     cfg: &Config,
     client: &MatrixClient,
     ev: &Event,
     seen: &mut HashSet<String>,
+    seen_dirty: &mut bool,
     agent: &mut String,
     voice_on: &mut bool,
+    sender_hits: &mut HashMap<String, VecDeque<Instant>>,
     started: Instant,
 ) -> Result<()> {
     if ev.kind != "m.room.message" {
         return Ok(());
     }
-    if ev.content.msgtype == "m.audio" {
-        return handle_voice(cfg, client, ev, seen, agent, voice_on).await;
-    }
-    if ev.content.msgtype != "m.text" {
+    if ev.content.msgtype != "m.text" && ev.content.msgtype != "m.audio" {
         return Ok(());
     }
     if ev.sender == cfg.bot_user_id {
@@ -229,6 +267,40 @@ async fn handle_event(
     }
     if !seen.insert(ev.id.clone()) {
         return Ok(());
+    }
+    *seen_dirty = true;
+    if seen.len() > cfg.max_seen_events {
+        tracing::warn!(
+            len = seen.len(),
+            max = cfg.max_seen_events,
+            "przekroczono MAX_SEEN_EVENTS — czyszczę zbiór seen"
+        );
+        seen.clear();
+        seen.insert(ev.id.clone());
+    }
+
+    // inbound rate limit per nadawca (sliding window 60s) — chroni też m.audio i zapobiega
+    // zalaniu pętli sync przez allowlistowanego nadawcę
+    let now = Instant::now();
+    let hits = sender_hits.entry(ev.sender.clone()).or_default();
+    hits.retain(|t| now.duration_since(*t) < Duration::from_secs(60));
+    if hits.len() >= cfg.inbound_max_per_min as usize {
+        tracing::warn!(
+            sender = %ev.sender,
+            "inbound rate limit ({}/min) — pomijam",
+            cfg.inbound_max_per_min
+        );
+        client
+            .send_text("⏳ Zwolnij — limit wiadomości na minutę został przekroczony.")
+            .await
+            .ok();
+        client.react(&ev.id, "❌").await.ok();
+        return Ok(());
+    }
+    hits.push_back(now);
+
+    if ev.content.msgtype == "m.audio" {
+        return handle_voice(cfg, client, ev, agent, voice_on).await;
     }
 
     let body = ev.content.body.trim();
@@ -265,19 +337,20 @@ async fn handle_event(
                     format!("✅ Agent ustawiony na `{agent}` (sesja tmux wystartuje przy następnej wiadomości)")
                 }
             }
-            BotCommand::Attach => {
-                match ensure_session(cfg, agent) {
-                    Ok(s) => match tmux_capture(&s) {
-                        Ok(c) => {
-                            let lines: Vec<&str> = c.lines().collect();
-                            let start = lines.len().saturating_sub(60);
-                            format!("📎 Ostatnie linie `{s}`:\n```\n{}\n```", lines[start..].join("\n"))
-                        }
-                        Err(e) => format!("⚠️ capture-pane: {e:#}"),
-                    },
-                    Err(e) => format!("⚠️ tmux: {e:#}"),
-                }
-            }
+            BotCommand::Attach => match ensure_session(cfg, agent) {
+                Ok(s) => match tmux_capture(&s) {
+                    Ok(c) => {
+                        let lines: Vec<&str> = c.lines().collect();
+                        let start = lines.len().saturating_sub(60);
+                        format!(
+                            "📎 Ostatnie linie `{s}`:\n```\n{}\n```",
+                            lines[start..].join("\n")
+                        )
+                    }
+                    Err(e) => format!("⚠️ capture-pane: {e:#}"),
+                },
+                Err(e) => format!("⚠️ tmux: {e:#}"),
+            },
             BotCommand::Stop => {
                 kill_session(cfg, agent);
                 "🛑 Sesja tmux zabita.".to_string()
@@ -291,7 +364,14 @@ async fn handle_event(
                 )
             }
             BotCommand::Voice(arg) => match arg.as_deref() {
-                None => format!("🎙️ Tryb voice: {}", if *voice_on { "ON (odpowiedzi głosem)" } else { "OFF" }),
+                None => format!(
+                    "🎙️ Tryb voice: {}",
+                    if *voice_on {
+                        "ON (odpowiedzi głosem)"
+                    } else {
+                        "OFF"
+                    }
+                ),
                 Some("on") => {
                     *voice_on = true;
                     let _ = save_str(&cfg.voice_file, "on");
@@ -310,7 +390,9 @@ async fn handle_event(
             },
             BotCommand::Help => HELP.to_string(),
         };
-        let sent = client.send_text_rel(&reply, Some(thread_rel(&ev.id))).await?;
+        let sent = client
+            .send_text_rel(&reply, Some(thread_rel(&ev.id)))
+            .await?;
         tracing::info!(reply_event = %sent, "odpowiedź na komendę");
         client.react(&ev.id, "✅").await.ok();
         return Ok(());
@@ -323,7 +405,10 @@ async fn handle_event(
             let reply = if clean.is_empty() {
                 "(agent zwrócił pustą odpowiedź — /attach żeby zobaczyć ekran)".to_string()
             } else if clean.len() > 3800 {
-                format!("{}…\n\n_(obcięte do 3800 znaków — /attach po pełny ekran)_", safe_truncate(&clean, 3800))
+                format!(
+                    "{}…\n\n_(obcięte do 3800 znaków — /attach po pełny ekran)_",
+                    safe_truncate(&clean, 3800)
+                )
             } else {
                 clean
             };
@@ -368,13 +453,22 @@ async fn run_agent_subprocess(cfg: &Config, agent: &str, prompt: &str) -> Result
     let sess_file = format!("{}.{}", cfg.session_file, agent);
     let sid = load_str_opt(&sess_file);
     let mut cmd = Command::new(agent_cmd(agent).context("nieznany agent")?);
-    cmd.arg("-p").arg(prompt).arg("--yolo").arg("--output").arg("json");
+    cmd.arg("-p")
+        .arg(prompt)
+        .arg("--yolo")
+        .arg("--output")
+        .arg("json");
     if let Some(s) = &sid {
         cmd.arg("--resume").arg(s);
     }
+    let agent_path = std::env::var("AGENT_PATH")
+        .or_else(|_| std::env::var("PATH"))
+        .unwrap_or_else(|_| {
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+        });
     cmd.current_dir(&cfg.vibe_workdir)
         .env_clear()
-        .env("PATH", "/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("PATH", agent_path)
         .env("HOME", &cfg.agent_home)
         .env("TERM", "dumb");
     for key in &cfg.vibe_env_keys {
@@ -387,13 +481,20 @@ async fn run_agent_subprocess(cfg: &Config, agent: &str, prompt: &str) -> Result
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = cmd.spawn().with_context(|| format!("spawn {agent}"))?;
-    let out = tokio::time::timeout(Duration::from_secs(cfg.vibe_timeout_secs), child.wait_with_output())
-        .await
-        .context("timeout agenta")?
-        .context("wait agenta")?;
+    let out = tokio::time::timeout(
+        Duration::from_secs(cfg.vibe_timeout_secs),
+        child.wait_with_output(),
+    )
+    .await
+    .context("timeout agenta")?
+    .context("wait agenta")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("{agent} exit {:?}: {}", out.status.code(), &stderr[..stderr.len().min(500)]);
+        anyhow::bail!(
+            "{agent} exit {:?}: {}",
+            out.status.code(),
+            &stderr[..stderr.len().min(500)]
+        );
     }
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     match parse_vibe_json(&stdout) {
@@ -434,16 +535,36 @@ async fn voice_out_watcher(cfg: Config, client: MatrixClient) {
             if sent.contains(&name) {
                 continue;
             }
-            if !(name.ends_with(".opus") || name.ends_with(".ogg") || name.ends_with(".wav") || name.ends_with(".mp3")) {
+            if !(name.ends_with(".opus")
+                || name.ends_with(".ogg")
+                || name.ends_with(".wav")
+                || name.ends_with(".mp3"))
+            {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(e.path()) else { continue };
-            let mime = if name.ends_with(".wav") { "audio/wav" } else { "audio/ogg" };
+            let Ok(bytes) = std::fs::read(e.path()) else {
+                continue;
+            };
+            let mime = if name.ends_with(".wav") {
+                "audio/wav"
+            } else {
+                "audio/ogg"
+            };
             match client.upload_media(&bytes, &name, mime).await {
                 Ok(mxc) => {
                     let dur = (bytes.len() / 4000) as u32 * 10; // estymata
                     let wf = pseudo_waveform(bytes.len());
-                    match client.send_audio(&format!("🎙️ {} (odpowiedź głosowa)", name), &mxc, mime, bytes.len(), dur.max(500), &wf).await {
+                    match client
+                        .send_audio(
+                            &format!("🎙️ {} (odpowiedź głosowa)", name),
+                            &mxc,
+                            mime,
+                            bytes.len(),
+                            dur.max(500),
+                            &wf,
+                        )
+                        .await
+                    {
                         Ok(eid) => {
                             tracing::info!(event = %eid, file = %name, "voice out -> Matrix");
                             sent.insert(name.clone());
@@ -463,17 +584,27 @@ fn thread_rel(root: &str) -> serde_json::Value {
     serde_json::json!({"rel_type": "m.thread", "event_id": root})
 }
 
-async fn send_reply(client: &MatrixClient, cfg: &Config, text: &str, voice_on: bool, thread_root: Option<&str>) -> Result<String> {
+async fn send_reply(
+    client: &MatrixClient,
+    cfg: &Config,
+    text: &str,
+    voice_on: bool,
+    thread_root: Option<&str>,
+) -> Result<String> {
     let rel = thread_root.map(thread_rel);
     if voice_on && std::env::var("MISTRAL_API_KEY").is_ok() {
         match tts(cfg, text).await {
             Ok((bytes, dur)) => {
-                let mxc = client.upload_media(&bytes, "reply.opus", "audio/ogg").await?;
+                let mxc = client
+                    .upload_media(&bytes, "reply.opus", "audio/ogg")
+                    .await?;
                 let wf = pseudo_waveform(text.len());
                 let body = format!("🎙️ {}", safe_truncate(text, 200));
                 // UWAGA: ten Synapse odrzuca m.audio z m.relates_to ("Cannot start threads from an event with a relation")
                 // więc voice odpowiedź idzie jako zwykła wiadomość (bez wątku); tekst może być w wątku.
-                return client.send_audio_rel(&body, &mxc, "audio/ogg", bytes.len(), dur, &wf, None).await;
+                return client
+                    .send_audio_rel(&body, &mxc, "audio/ogg", bytes.len(), dur, &wf, None)
+                    .await;
             }
             Err(e) => tracing::warn!("TTS nieudane, wysyłam tekst: {e:#}"),
         }
@@ -481,33 +612,44 @@ async fn send_reply(client: &MatrixClient, cfg: &Config, text: &str, voice_on: b
     client.send_text_rel(text, rel).await
 }
 
-/// m.audio -> download -> STT -> agent (tmux) -> odpowiedź (głosem jeśli voice_on).
+/// m.audio -> download -> STT -> agent -> odpowiedź (głosem jeśli voice_on).
 async fn handle_voice(
     cfg: &Config,
     client: &MatrixClient,
     ev: &Event,
-    seen: &mut HashSet<String>,
     agent: &mut String,
     voice_on: &mut bool,
 ) -> Result<()> {
     if ev.content.file.is_some() {
-        client.send_text("⚠️ zaszyfrowane media (E2EE) nie są obsługiwane w MVP").await.ok();
+        client
+            .send_text("⚠️ zaszyfrowane media (E2EE) nie są obsługiwane w MVP")
+            .await
+            .ok();
         return Ok(());
     }
     let mxc = ev.content.url.clone().context("m.audio bez url")?;
-    if !seen.insert(ev.id.clone()) {
-        return Ok(());
-    }
     client.react(&ev.id, "👀").await.ok();
     let (fname, bytes, mime) = match client.download_mxc(&mxc).await {
         Ok(t) => t,
         Err(e) => {
-            client.send_text(&format!("⚠️ nie pobrałem audio: {e:#}")).await.ok();
+            client
+                .send_text(&format!("⚠️ nie pobrałem audio: {e:#}"))
+                .await
+                .ok();
             return Ok(());
         }
     };
     std::fs::create_dir_all(&cfg.uploads_dir).ok();
-    let safe_name: String = fname.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }).collect();
+    let safe_name: String = fname
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     let path = format!("{}/{}", cfg.uploads_dir, safe_name);
     let _ = std::fs::write(&path, &bytes);
 
@@ -533,13 +675,18 @@ async fn handle_voice(
                 }
             }
         }
-        if answered { break; }
+        if answered {
+            break;
+        }
     }
     if answered {
         client.react(&ev.id, "✅").await.ok();
         return Ok(());
     }
-    tracing::warn!("brak odpowiedzi z voice/out/ po {}s — fallback API (STT->agent->TTS)", cfg.voice_fallback_secs);
+    tracing::warn!(
+        "brak odpowiedzi z voice/out/ po {}s — fallback API (STT->agent->TTS)",
+        cfg.voice_fallback_secs
+    );
 
     let text = match stt(cfg, &bytes, &safe_name, &mime).await {
         Ok(t) if !t.trim().is_empty() => t,
@@ -570,7 +717,10 @@ async fn handle_voice(
             client.react(&ev.id, "✅").await.ok();
         }
         Err(e) => {
-            client.send_text(&format!("⚠️ błąd agenta: {e:#}")).await.ok();
+            client
+                .send_text(&format!("⚠️ błąd agenta: {e:#}"))
+                .await
+                .ok();
             client.react(&ev.id, "❌").await.ok();
         }
     }
@@ -579,7 +729,8 @@ async fn handle_voice(
 
 /// STT przez Mistral /v1/audio/transcriptions.
 async fn stt(cfg: &Config, audio: &[u8], filename: &str, mime: &str) -> Result<String> {
-    let key = std::env::var("MISTRAL_API_KEY").context("brak MISTRAL_API_KEY — voice niedostępne")?;
+    let key =
+        std::env::var("MISTRAL_API_KEY").context("brak MISTRAL_API_KEY — voice niedostępne")?;
     let http = reqwest::Client::new();
     let part = reqwest::multipart::Part::bytes(audio.to_vec())
         .file_name(filename.to_string())
@@ -627,7 +778,9 @@ async fn tts(cfg: &Config, text: &str) -> Result<(Vec<u8>, u32)> {
     }
     // Mistral zwraca JSON {"audio_data": "<base64 OGG/Opus>"}
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let b64 = v["audio_data"].as_str().context("TTS: brak audio_data w odpowiedzi")?;
+    let b64 = v["audio_data"]
+        .as_str()
+        .context("TTS: brak audio_data w odpowiedzi")?;
     let bytes = STANDARD.decode(b64).context("TTS: base64 decode")?;
     let duration_ms = ((text.split_whitespace().count() as f64 / 150.0) * 60_000.0) as u32;
     Ok((bytes, duration_ms.max(500)))
@@ -635,24 +788,34 @@ async fn tts(cfg: &Config, text: &str) -> Result<(Vec<u8>, u32)> {
 
 /// Prosta pseudo-fala (sinusoida) do voice message.
 fn pseudo_waveform(_text_len: usize) -> Vec<u32> {
-    (0..40).map(|i| (300.0 + (i as f32 * 0.7).sin() * 200.0) as u32).collect()
+    (0..40)
+        .map(|i| (300.0 + (i as f32 * 0.7).sin() * 200.0) as u32)
+        .collect()
 }
 
 fn parse_vibe_json(s: &str) -> Option<(String, String)> {
     let v: serde_json::Value = serde_json::from_str(s).ok()?;
     let arr = v.as_array()?;
-    let sid = arr.iter().find_map(|e| e.get("sessionId")?.as_str()).unwrap_or("").to_string();
+    let sid = arr
+        .iter()
+        .find_map(|e| e.get("sessionId")?.as_str())
+        .unwrap_or("")
+        .to_string();
     let mut text = String::new();
     for e in arr.iter().rev() {
         if e.get("role").and_then(|r| r.as_str()) == Some("assistant") {
             if let Some(content) = e.get("content").and_then(|c| c.as_array()) {
                 for c in content {
                     if c.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(t) = c.get("text").and_then(|t| t.as_str()) { text.push_str(t); }
+                        if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
+                            text.push_str(t);
+                        }
                     }
                 }
             }
-            if !text.is_empty() { break; }
+            if !text.is_empty() {
+                break;
+            }
         }
     }
     Some((sid, text))
@@ -669,13 +832,22 @@ mod tests {
             parse_command("/new codex"),
             Some(BotCommand::New(Some("codex".to_string())))
         );
-        assert_eq!(parse_command("/agent agy"), Some(BotCommand::Agent("agy".to_string())));
+        assert_eq!(
+            parse_command("/agent agy"),
+            Some(BotCommand::Agent("agy".to_string()))
+        );
         assert_eq!(parse_command("/attach"), Some(BotCommand::Attach));
         assert_eq!(parse_command("/stop"), Some(BotCommand::Stop));
         assert_eq!(parse_command("/status"), Some(BotCommand::Status));
-        assert_eq!(parse_command("/voice on"), Some(BotCommand::Voice(Some("on".to_string()))));
+        assert_eq!(
+            parse_command("/voice on"),
+            Some(BotCommand::Voice(Some("on".to_string())))
+        );
         assert_eq!(parse_command("/voice"), Some(BotCommand::Voice(None)));
-        assert_eq!(parse_command("/voice new"), Some(BotCommand::Voice(Some("new".to_string()))));
+        assert_eq!(
+            parse_command("/voice new"),
+            Some(BotCommand::Voice(Some("new".to_string())))
+        );
         assert_eq!(parse_command("/help"), Some(BotCommand::Help));
         // komendy agenta (NIE bridge'a) -> None = lecą do tmuxa
         assert_eq!(parse_command("/model mistral-large-latest"), None);
@@ -685,8 +857,11 @@ mod tests {
 
     #[test]
     fn agent_cmds() {
-        assert_eq!(agent_cmd("vibe"), Some("vibe"));
-        assert_eq!(agent_cmd("AGY"), Some("/root/.local/bin/agy"));
+        assert_eq!(agent_cmd("vibe").as_deref(), Some("vibe"));
+        assert_eq!(agent_cmd("codex").as_deref(), Some("codex"));
+        assert_eq!(agent_cmd("claude").as_deref(), Some("claude"));
+        // AGY_CMD nieustawione w testach -> domyślne "agy" z PATH
+        assert_eq!(agent_cmd("AGY").as_deref(), Some("agy"));
         assert_eq!(agent_cmd("nieznany"), None);
     }
 }

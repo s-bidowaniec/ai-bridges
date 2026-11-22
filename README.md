@@ -8,7 +8,7 @@ Monorepo mostków (bridges) między platformami AI a komunikatorami / CLI oraz n
 
 | # | Bridge | Status | Język | Opis |
 |---|---|---|---|---|
-| 1 | [`bridges/vibe-matrix`](bridges/vibe-matrix/) | ✅ działa | Python 3.12 | Mostek Matrix room ↔ Vibe CLI (`vibe -p` headless + TUI w tmux). Reakcje 👀✅❌, typing indicator, media (image/video/audio/file) w obie strony, allowlist, kolejka promptów. |
+| 1 | [`bridges/vibe-matrix`](bridges/vibe-matrix/) | 🗄️ legacy (działa na VPS) | Python 3.12 | Mostek Matrix room ↔ Vibe CLI. **Źródło `bridge.py` niekompletne w repo** (tylko fragment `bridge.py.b64.001`) + prototyp Fazy 6 (`voice_call.py`) — zastępowany przez `vibe-matrix-rs`. Patrz `bridges/vibe-matrix/README.md`. |
 | — | `bridges/vibe-matrix-rs` | 📋 prototyp (Faza 5) | Rust | Przepisanie na Rust z hardeningiem — [docs/ROADMAP-RUST.md](docs/ROADMAP-RUST.md). Code review prototypu przez octomesh: [P1+P2](docs/REVIEW-vibe-matrix-rs-octomesh-P1-P2.md), [P3 + podsumowanie](docs/REVIEW-vibe-matrix-rs-octomesh-P3-summary.md) |
 
 ## Tools
@@ -33,6 +33,10 @@ ai-bridges/
     ├── ROADMAP-RUST.md     # roadmapa przepisania na Rust + hardening
     └── REVIEW-*.md         # raporty code review (via octomesh)
 ```
+
+## Licencja
+
+[GPL-3.0-only](LICENSE) — patrz `LICENSE` w root repo.
 
 ## Zasady
 

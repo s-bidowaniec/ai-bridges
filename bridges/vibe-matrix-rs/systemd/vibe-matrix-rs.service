@@ -1,31 +1,47 @@
 [Unit]
-Description=vibe-matrix-rs (Rust bridge: Matrix room <-> vibe -p headless)
+Description=vibe-matrix-rs (Rust bridge: Matrix room <-> terminal agent w tmux)
 After=network.target matrix-synapse.service
 
 [Service]
 Type=simple
-User=root
+# Dedykowany user, NIE root. Jednorazowy setup:
+#   useradd -r -d /var/lib/vibe-matrix-rs -s /usr/sbin/nologin vibe-matrix-rs
+#   install -d -m 0750 -o vibe-matrix-rs -g vibe-matrix-rs /var/lib/vibe-matrix-rs
+#   env file: root:vibe-matrix-rs, chmod 640 (zawiera MATRIX_ACCESS_TOKEN!)
+# Konfiguracje agentów (vibe/claude/codex/agy) żyją w HOME=/var/lib/vibe-matrix-rs.
+User=vibe-matrix-rs
+Group=vibe-matrix-rs
+StateDirectory=vibe-matrix-rs
+Environment=HOME=/var/lib/vibe-matrix-rs
 WorkingDirectory=/opt/ai-bridges/bridges/vibe-matrix-rs
 EnvironmentFile=/etc/vibe-matrix-rs.env
 ExecStart=/opt/ai-bridges/bridges/vibe-matrix-rs/target/release/bridge-headless
 Restart=always
 RestartSec=5
 
-# hardening (Faza 3 roadmapy — rozszerzymy)
-# UWAGA: bez MemoryDenyWriteExecute — vibe (Bun/Node JIT) wymaga W+X.
+# hardening (bez MemoryDenyWriteExecute — vibe/Bun JIT wymaga W+X)
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=read-only
+ProtectHome=yes
 PrivateTmp=true
-# vibe musi zapisywać logi/sesje w /root/.vibe, stan bridge w /var/lib
-ReadWritePaths=/var/lib/vibe-matrix-rs /root/.vibe
+PrivateDevices=true
+ReadWritePaths=/var/lib/vibe-matrix-rs
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictSUIDSGID=true
-LockPersonality=true
 RestrictNamespaces=true
+LockPersonality=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
