@@ -23,27 +23,40 @@ command = "mock"
 timeout_secs = 10
 cooldown_secs = 60
 
+# Prawdziwe agenty domyślnie w trybie "tmux": żyją w stałej sesji tmux
+# `<session_prefix>-<peer>` i pamiętają kontekst między kolejnymi `octo ask`.
+# Wymaga zainstalowanego tmux na hoście. `mode = "oneshot"` = stary subprocess `-p`.
+
 [peers.claude]
 adapter = "claude"
 command = "claude"
+mode = "tmux"
+session_prefix = "octo"
 timeout_secs = 180
 cooldown_secs = 300
 
 [peers.vibe]
 adapter = "vibe"
 command = "vibe"
+mode = "tmux"
+session_prefix = "octo"
+launch_args = ["--yolo"]
 timeout_secs = 180
 cooldown_secs = 180
 
 [peers.codex]
 adapter = "codex"
 command = "codex"
+mode = "tmux"
+session_prefix = "octo"
 timeout_secs = 180
 cooldown_secs = 300
 
 [peers.agy]
 adapter = "agy"
-command = "/root/.local/bin/agy"
+command = "agy"
+mode = "tmux"
+session_prefix = "octo"
+launch_args = ["--dangerously-skip-permissions"]
 timeout_secs = 300
 cooldown_secs = 300
-extra_args = ["--dangerously-skip-permissions"]

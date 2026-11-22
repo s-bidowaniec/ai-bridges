@@ -27,6 +27,11 @@ class AdapterRequest:
     extra_args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     cwd: str = "."
+    # Tryb pracy peera: "oneshot" (subprocess `-p` per zadanie) lub "tmux" (trwała sesja).
+    mode: str = "oneshot"
+    session_prefix: str = "octo"
+    launch_args: list[str] = field(default_factory=list)
+    tmux_bin: str = "tmux"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AdapterRequest:
@@ -41,6 +46,10 @@ class AdapterRequest:
             extra_args=[str(x) for x in data.get("extra_args", [])],
             env={str(k): str(v) for k, v in data.get("env", {}).items()},
             cwd=str(data.get("cwd", ".")),
+            mode=str(data.get("mode", "oneshot")),
+            session_prefix=str(data.get("session_prefix", "octo")),
+            launch_args=[str(x) for x in data.get("launch_args", [])],
+            tmux_bin=str(data.get("tmux_bin", "tmux")),
         )
 
 

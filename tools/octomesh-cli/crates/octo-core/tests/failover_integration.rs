@@ -25,7 +25,7 @@ fn build_test_config(state_db: PathBuf) -> OctoConfig {
             timeout_secs: 10,
             cooldown_secs: Some(120),
             extra_args: vec!["--simulate-rate-limit-on-keyword".to_string()],
-            env: HashMap::new(),
+            ..Default::default()
         },
     );
 
@@ -37,7 +37,7 @@ fn build_test_config(state_db: PathBuf) -> OctoConfig {
             timeout_secs: 10,
             cooldown_secs: Some(60),
             extra_args: vec![],
-            env: HashMap::new(),
+            ..Default::default()
         },
     );
 

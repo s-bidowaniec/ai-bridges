@@ -197,7 +197,10 @@ async fn handle_tool_call(router: &MeshRouter, id: Value, params: Value) -> Json
         .get("name")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     match tool_name {
         "mesh_status" => {
@@ -212,7 +215,10 @@ async fn handle_tool_call(router: &MeshRouter, id: Value, params: Value) -> Json
                         "peers": peers,
                         "recent_handoffs": handoffs,
                     });
-                    tool_ok(id, serde_json::to_string_pretty(&payload).unwrap_or_default())
+                    tool_ok(
+                        id,
+                        serde_json::to_string_pretty(&payload).unwrap_or_default(),
+                    )
                 }
                 Err(e) => tool_err(id, format!("Failed to read blackboard status: {}", e)),
             }
@@ -251,10 +257,8 @@ async fn handle_tool_call(router: &MeshRouter, id: Value, params: Value) -> Json
 
             match router.ask(req).await {
                 Ok(resp) => {
-                    let formatted = format!(
-                        "[resolved_peer: {}]\n\n{}",
-                        resp.resolved_peer, resp.output
-                    );
+                    let formatted =
+                        format!("[resolved_peer: {}]\n\n{}", resp.resolved_peer, resp.output);
                     tool_ok(id, formatted)
                 }
                 Err(e) => tool_err(id, e.to_string()),
@@ -267,7 +271,9 @@ async fn handle_tool_call(router: &MeshRouter, id: Value, params: Value) -> Json
                 .unwrap_or("unknown");
             let task_summary = match args.get("task_summary").and_then(|v| v.as_str()) {
                 Some(s) => s,
-                None => return tool_err(id, "Missing required argument 'task_summary'".to_string()),
+                None => {
+                    return tool_err(id, "Missing required argument 'task_summary'".to_string())
+                }
             };
             let next_steps = match args.get("next_steps").and_then(|v| v.as_str()) {
                 Some(s) => s,
@@ -283,10 +289,12 @@ async fn handle_tool_call(router: &MeshRouter, id: Value, params: Value) -> Json
                 })
                 .unwrap_or_default();
 
-            match router
-                .blackboard()
-                .record_handoff(author, task_summary, next_steps, &files_touched)
-            {
+            match router.blackboard().record_handoff(
+                author,
+                task_summary,
+                next_steps,
+                &files_touched,
+            ) {
                 Ok(note) => tool_ok(
                     id,
                     format!(

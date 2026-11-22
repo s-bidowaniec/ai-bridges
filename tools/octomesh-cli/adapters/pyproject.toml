@@ -2,7 +2,7 @@
 name = "octomesh-adapters"
 version = "0.1.0"
 description = "Python CLI adapter layer for octomesh-cli"
-readme = "../README.md"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 

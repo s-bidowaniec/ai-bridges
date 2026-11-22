@@ -40,6 +40,35 @@ pub struct PeerConfig {
     pub extra_args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Tryb peera: "oneshot" (subprocess `-p` per zadanie, domyślnie) lub "tmux"
+    /// (agent żyje w stałej sesji tmux `<session_prefix>-<peer>` i pamięta kontekst).
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default = "default_session_prefix")]
+    pub session_prefix: String,
+    /// Argumenty startowe agenta w sesji tmux (np. ["--yolo"]).
+    #[serde(default)]
+    pub launch_args: Vec<String>,
+}
+
+fn default_session_prefix() -> String {
+    "octo".to_string()
+}
+
+impl Default for PeerConfig {
+    fn default() -> Self {
+        Self {
+            adapter: String::new(),
+            command: String::new(),
+            timeout_secs: default_timeout_secs(),
+            cooldown_secs: None,
+            extra_args: Vec::new(),
+            env: HashMap::new(),
+            mode: "oneshot".to_string(),
+            session_prefix: default_session_prefix(),
+            launch_args: Vec::new(),
+        }
+    }
 }
 
 fn default_max_depth() -> u32 {

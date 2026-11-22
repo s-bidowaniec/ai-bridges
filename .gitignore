@@ -35,3 +35,7 @@ work/uploads/
 
 # Rust
 target/
+
+# octomesh runtime/local config (może zawierać sekrety env)
+octomesh.toml
+.octomesh/

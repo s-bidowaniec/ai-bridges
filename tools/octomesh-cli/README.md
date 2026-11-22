@@ -116,17 +116,36 @@ mock_chain = ["mock-fast", "mock-safe"]
 [peers.claude]
 adapter = "claude"
 command = "claude"
-timeout_secs = 120
+mode = "tmux"            # "tmux" = trwała sesja agenta, "oneshot" = subprocess `-p` per zadanie
+session_prefix = "octo"  # sesja tmux: octo-claude
+timeout_secs = 180
 cooldown_secs = 300
 
 [peers.vibe]
 adapter = "vibe"
 command = "vibe"
-timeout_secs = 120
+mode = "tmux"
+launch_args = ["--yolo"]
+timeout_secs = 180
 cooldown_secs = 180
 ```
 
+### Peer modes: `tmux` (persistent) vs `oneshot`
+
+- **`mode = "tmux"`** (zalecane dla vibe/codex/claude/agy): agent żyje w stałej sesji
+  tmux `<session_prefix>-<peer>` (`tmux ls` pokazuje np. `octo-vibe`). Adapter robi tylko
+  `send-keys -l <prompt>` + `Enter`, potem poll `capture-pane -p -S -300` aż ekran się
+  ustabilizuje (3 identyczne próbki), i zwraca **samą nową część ekranu** (suffix po
+  poprzednim capture). Kontekst rozmowy zostaje w sesji między kolejnymi `octo ask`.
+  Wymaga tmux na hoście. `launch_args` leci jako argumenty startowe CLI w sesji.
+- **`mode = "oneshot"`** (domyślny, back-compat): adapter odpala CLI jako subprocess
+  (`vibe --prompt ...`, `agy -p ...`) — bez pamięci między zadaniami.
+
+Reguła: `mock` zawsze jedzie jako oneshot; prawdziwe CLI mogą jechać w obu trybach.
+
 ---
+
+## Adding a New CLI Adapter
 
 ## Adding a New CLI Adapter
 
@@ -148,5 +167,8 @@ class MyAgentAdapter(BaseAdapter):
         )
 ```
 
-2. Register `"my_agent": MyAgentAdapter` in `adapters/octomesh_adapters/runner.py`.
+2. Register `"my_agent": MyAgentAdapter` in `adapters/octomesh_adapters/runner.py`
+   (`ADAPTER_REGISTRY` dla oneshot; dopisz też do `TMUX_CAPABLE`, jeśli CLI potrafi
+   żyć w sesji tmux — wtedy dostępny jako `mode = "tmux"` przez `TmuxCliAdapter`,
+   z domyślnymi `launch_args` w `tmux_cli.DEFAULT_LAUNCH_ARGS`).
 3. Add `[peers.my_agent]` to `octomesh.toml` and include `"my_agent"` in `[roles]`.

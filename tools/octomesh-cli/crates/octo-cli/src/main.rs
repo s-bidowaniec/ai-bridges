@@ -163,7 +163,10 @@ fn cmd_init(workdir: &Path, config_path: &Path, force: bool, sync_agents: bool) 
                 f.write_all(snippet.as_bytes())?;
                 println!("Synced mesh instructions into {}", doc_path.display());
             } else {
-                println!("{} already contains OctoMesh instructions.", doc_path.display());
+                println!(
+                    "{} already contains OctoMesh instructions.",
+                    doc_path.display()
+                );
             }
         }
     }
@@ -237,7 +240,7 @@ async fn cmd_ask(
             target,
             prompt,
             caller,
-            depth: 0,
+            depth: 1,
             include_diff,
             readonly,
         })

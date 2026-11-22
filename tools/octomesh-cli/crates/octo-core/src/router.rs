@@ -225,6 +225,14 @@ impl MeshRouter {
                         cooldown,
                         &err_msg,
                     )?;
+                    self.blackboard.record_task(
+                        req.caller.as_deref(),
+                        &req.target,
+                        &peer_name,
+                        req.depth,
+                        "adapter_error",
+                        &req.prompt,
+                    )?;
                     attempts.push(AttemptRecord {
                         peer: peer_name,
                         outcome: "adapter_error".to_string(),
@@ -236,7 +244,14 @@ impl MeshRouter {
 
         let summary = attempts
             .iter()
-            .map(|a| format!("{}: {} ({})", a.peer, a.outcome, a.error.as_deref().unwrap_or("")))
+            .map(|a| {
+                format!(
+                    "{}: {} ({})",
+                    a.peer,
+                    a.outcome,
+                    a.error.as_deref().unwrap_or("")
+                )
+            })
             .collect::<Vec<_>>()
             .join("; ");
 

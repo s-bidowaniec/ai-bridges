@@ -22,6 +22,33 @@ pub struct AdapterPayload {
     pub extra_args: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default = "default_session_prefix")]
+    pub session_prefix: String,
+    #[serde(default)]
+    pub launch_args: Vec<String>,
+}
+
+fn default_session_prefix() -> String {
+    "octo".to_string()
+}
+
+/// Maskuje wartości sekretów z `env` (klucze zawierające KEY/TOKEN/SECRET/PASSWORD)
+/// w tekście, który może trafić do logów lub blackboarda (stderr CLI potrafi echo'ować klucze).
+fn redact_secrets(text: &str, env: &HashMap<String, String>) -> String {
+    let mut out = text.to_string();
+    for (key, val) in env {
+        let k = key.to_uppercase();
+        let sensitive = k.contains("KEY")
+            || k.contains("TOKEN")
+            || k.contains("SECRET")
+            || k.contains("PASSWORD");
+        if sensitive && val.len() >= 8 {
+            out = out.replace(val.as_str(), "***");
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -68,6 +95,9 @@ pub async fn invoke_python_adapter(
         extra_args: peer_cfg.extra_args.clone(),
         env: peer_cfg.env.clone(),
         cwd: workdir.to_string_lossy().to_string(),
+        mode: peer_cfg.mode.clone(),
+        session_prefix: peer_cfg.session_prefix.clone(),
+        launch_args: peer_cfg.launch_args.clone(),
     };
 
     let stdin_json = serde_json::to_vec(&payload)?;
@@ -117,7 +147,10 @@ pub async fn invoke_python_adapter(
         }
     };
 
-    let stderr_str = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stderr_str = redact_secrets(
+        String::from_utf8_lossy(&output.stderr).trim(),
+        &peer_cfg.env,
+    );
     if !stderr_str.is_empty() {
         debug!(peer = peer_name, stderr = %stderr_str, "Adapter stderr output");
     }
@@ -137,12 +170,20 @@ pub async fn invoke_python_adapter(
         });
     }
 
-    let parsed: AdapterResult = serde_json::from_str(&stdout_str).map_err(|e| {
+    let mut parsed: AdapterResult = serde_json::from_str(&stdout_str).map_err(|e| {
         OctoError::AdapterFailure(format!(
             "Invalid JSON from adapter '{}': {} (raw stdout: {})",
-            peer_cfg.adapter, e, stdout_str
+            peer_cfg.adapter,
+            e,
+            redact_secrets(&stdout_str, &peer_cfg.env)
         ))
     })?;
+
+    // redakcja sekretów również w odpowiedzi adaptera (może zawierać echo env)
+    parsed.output = redact_secrets(&parsed.output, &peer_cfg.env);
+    if let Some(msg) = &parsed.error_message {
+        parsed.error_message = Some(redact_secrets(msg, &peer_cfg.env));
+    }
 
     Ok(parsed)
 }

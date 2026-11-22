@@ -26,7 +26,9 @@ class AgyAdapter(BaseAdapter):
 
     def execute(self, req: AdapterRequest) -> AdapterResponse:
         binary = req.command or "agy"
-        if shutil.which(binary) is None and not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
+        if shutil.which(binary) is None and not (
+            os.path.isfile(binary) and os.access(binary, os.X_OK)
+        ):
             return AdapterResponse(
                 status=ErrorCode.CLI_NOT_FOUND,
                 error_message=f"CLI binary '{binary}' not found in PATH",
@@ -72,7 +74,11 @@ class AgyAdapter(BaseAdapter):
             combined = f"{proc.stderr}\n{proc.stdout}"
             code = classify_cli_failure(proc.returncode, proc.stderr, proc.stdout)
             lowered = combined.lower()
-            if "authentication required" in lowered or "not logged in" in lowered or "oauth" in lowered:
+            if (
+                "authentication required" in lowered
+                or "not logged in" in lowered
+                or "oauth" in lowered
+            ):
                 code = ErrorCode.AUTH_ERROR
             return AdapterResponse(
                 status=code,

@@ -326,8 +326,7 @@ impl Blackboard {
         let rows = stmt.query_map(params![limit as i64], |r| {
             let files_json: String = r.get(4)?;
             let created_str: String = r.get(5)?;
-            let files_touched: Vec<String> =
-                serde_json::from_str(&files_json).unwrap_or_default();
+            let files_touched: Vec<String> = serde_json::from_str(&files_json).unwrap_or_default();
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());

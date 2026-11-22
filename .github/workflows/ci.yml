@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust-vibe-matrix-rs:
+    name: Rust bridge (bridges/vibe-matrix-rs)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bridges/vibe-matrix-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Rust unit tests
+        run: cargo test --workspace
+
+  rust-octomesh-cli:
+    name: Rust octomesh-cli (tools/octomesh-cli)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/octomesh-cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Rust unit & integration tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tools/octomesh-cli/adapters
+        run: cargo test --workspace
+
+  python-adapters:
+    name: Python adapters (ruff, pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/octomesh-cli/adapters
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: uv sync --dev
+      - name: Lint with ruff
+        run: uv run ruff check .
+      - name: Run pytest
+        run: uv run pytest -v
