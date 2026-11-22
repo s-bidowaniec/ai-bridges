@@ -40,3 +40,10 @@ adapter = "codex"
 command = "codex"
 timeout_secs = 180
 cooldown_secs = 300
+
+[peers.agy]
+adapter = "agy"
+command = "/root/.local/bin/agy"
+timeout_secs = 300
+cooldown_secs = 300
+extra_args = ["--dangerously-skip-permissions"]
