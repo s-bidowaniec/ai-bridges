@@ -1,13 +1,17 @@
-# Szablon systemowy (root): jedna instancja na agenta.
-#   env: /etc/vibe-matrix-rs/<agent>.env   (chmod 600!)
-#   start: systemctl enable --now vibe-matrix-rs@vibe
+# Szablon systemowy: jedna instancja na agenta (nie root).
+#   setup:  useradd -r -d /var/lib/vibe-matrix-rs -s /usr/sbin/nologin vibe-matrix-rs
+#   env:    /etc/vibe-matrix-rs/<agent>.env  owner root:vibe-matrix-rs, chmod 640
+#   start:  systemctl enable --now vibe-matrix-rs@vibe
 [Unit]
 Description=vibe-matrix-rs (Rust bridge Matrix <-> agent, instancja %i)
 After=network.target
 
 [Service]
 Type=simple
-User=root
+User=vibe-matrix-rs
+Group=vibe-matrix-rs
+StateDirectory=vibe-matrix-rs
+Environment=HOME=/var/lib/vibe-matrix-rs
 EnvironmentFile=/etc/vibe-matrix-rs/%i.env
 ExecStart=/opt/ai-bridges/bridges/vibe-matrix-rs/target/release/bridge-headless
 Restart=always
@@ -16,16 +20,26 @@ RestartSec=5
 # hardening (bez MemoryDenyWriteExecute — vibe/Bun JIT wymaga W+X)
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=read-only
+ProtectHome=yes
 PrivateTmp=true
-ReadWritePaths=/var/lib/vibe-matrix-rs /root/.vibe /root/.claude /root/.codex /root/.config/antigravity
+PrivateDevices=true
+ReadWritePaths=/var/lib/vibe-matrix-rs
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictSUIDSGID=true
-LockPersonality=true
 RestrictNamespaces=true
+LockPersonality=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

@@ -11,22 +11,36 @@ Mostek Matrix room ↔ `vibe -p --yolo` (headless), przepisany z `bridges/vibe-m
 - czyszczenie ANSI z odpowiedzi TUI (`clean_ansi`), limit 3800 znaków odpowiedzi
 - systemd unit z podstawowym hardeningiem
 
-## Env (/etc/vibe-matrix-rs.env, chmod 600)
+## Env (pełna lista w `.env.example`)
+System: `/etc/vibe-matrix-rs.env` (lub `/etc/vibe-matrix-rs/<agent>.env` dla `@.service`),
+owner `root:vibe-matrix-rs`, **chmod 640**. User: `~/.config/vibe-matrix-rs/<agent>.env`, chmod 600.
 ```
-MATRIX_HOMESERVER=https://matrix.owl-post.eu
+MATRIX_HOMESERVER=https://matrix.owl-post.eu   # https:// wymagane (ALLOW_INSECURE_HTTP=1 tylko lokalnie)
 MATRIX_ACCESS_TOKEN=...
 MATRIX_ROOM_ID=!....:matrix.owl-post.eu
 MATRIX_BOT_USER_ID=@vibe-rs:matrix.owl-post.eu
 MATRIX_ALLOWED_USERS=@stanislaw:matrix.owl-post.eu
-VIBE_CMD=vibe
+INBOUND_MAX_PER_MIN=6      # rate limit inbound per nadawca (sliding window 60s)
+MAX_SEEN_EVENTS=100000     # cap zbioru dedup
 VIBE_TIMEOUT_SECS=600
 SYNC_TIMEOUT_MS=30000
 STATE_FILE=/var/lib/vibe-matrix-rs/seen.txt
+SESSION_FILE=/var/lib/vibe-matrix-rs/session.txt
+AGENT_FILE=/var/lib/vibe-matrix-rs/agent.txt
+TMUX_PREFIX=vibe-matrix-rs
+VIBE_WORKDIR=/var/lib/vibe-matrix-rs/vibe-work
+AGENT_HOME=/var/lib/vibe-matrix-rs/agent-home
 VIBE_ENV_KEYS=MISTRAL_API_KEY
+# AGY_CMD=agy               # ścieżka do binarki agy (default: z PATH)
+# AGENT_PATH=...            # opcjonalny PATH dla subprocessu agenta
 ```
 
-## Build & run (na VPS)
+## Build & run (na VPS, jako dedykowany user — NIE root)
 ```
+useradd -r -d /var/lib/vibe-matrix-rs -s /usr/sbin/nologin vibe-matrix-rs
+install -d -m 0750 -o vibe-matrix-rs -g vibe-matrix-rs /var/lib/vibe-matrix-rs
+# env file: root:vibe-matrix-rs, chmod 640; konfiguracje agentów (vibe/claude/...)
+# żyją w HOME=/var/lib/vibe-matrix-rs (ustawionym w unitcie)
 cd /opt/ai-bridges/bridges/vibe-matrix-rs
 cargo build --release
 systemctl enable --now vibe-matrix-rs
@@ -62,8 +76,9 @@ Architektura: agent (vibe/codex/claude/agy) żyje w stałej sesji **tmux**, brid
 - odpowiedź wykrywana przez poll `capture-pane` co 2s (koniec = 3 próbki bez zmian, max `VIBE_TIMEOUT_SECS`)
 - komendy bridge'a: `/new [agent]`, `/agent <vibe|codex|claude|agy>`, `/attach` (capture ekranu), `/stop`, `/status`, `/help`
 - wszystkie inne wiadomości (także `/model`, `/think` TUI agenta) lecą prosto do tmuxa — kontekst pamięta agent
-- env: `AGENT_FILE`, `TMUX_PREFIX`, `VIBE_WORKDIR` (reszta jak wcześniej)
-- uwaga: `agy` wymaga OAuth login na hoście (interaktywnie), inaczej sesja tmux od razu pada
+- env: `AGENT_FILE`, `TMUX_PREFIX`, `VIBE_WORKDIR`, `AGY_CMD` (ścieżka do binarki agy), `AGENT_PATH`, `INBOUND_MAX_PER_MIN` (rate limit inbound), `MAX_SEEN_EVENTS` (reszta jak wcześniej)
+- hardening: inbound rate limit per nadawca (sliding 60s, dla tekstu i `m.audio`), wymuszenie `https://` dla homeservera, token jako `SecretString`, zbiór `seen` z capem `MAX_SEEN_EVENTS` i zapisem tylko przy zmianie, walidacja agenta z `AGENT_FILE`
+- uwaga: `agy` wymaga OAuth login na hoście (interaktywnie, w jego `$HOME`), inaczej sesja tmux od razu pada
 
 ## v6 — voice (m.audio ↔ STT/TTS przez Mistral API)
 - wiadomość głosowa (`m.audio`) → download mxc → **STT** (`/v1/audio/transcriptions`, model `voxtral-mini-latest`, auto-language) → tekst → agent w tmux (`[voice message od ...]: ...`) → odpowiedź

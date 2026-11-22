@@ -1,3 +1,5 @@
+> ⚠️ **Stale od commitu `f79e628`:** raport dotyczy poprzedniej architektury "Faza 5" (crates `bridge-tui`/`bridge-voice`/`bridge-agents`/`bridge-control`), nieistniejącej w HEAD — aktualny kod to v5 tmux (3 crates). Część ustaleń została już zaadresowana (patrz `bridges/vibe-matrix-rs/README.md`). Raport zostaje jako historia.
+
 # Code Review — vibe-matrix-rs (Faza 5): P3 + podsumowanie (część 2/2)
 
 ## P3 — usprawnienia / hardening

@@ -1,3 +1,5 @@
+> ⚠️ **Stale od commitu `f79e628`:** ten raport dotyczy poprzedniej architektury "Faza 5" (crates `bridge-tui`/`bridge-voice`/`bridge-agents`/`bridge-control`, matrix-sdk), która nie istnieje już w HEAD — aktualny kod to przepisanie **v5 tmux** (3 crates, `bridges/vibe-matrix-rs/`). Niektóre ustalenia (root, brak rate limitingu, media) zostały już zaadresowane w v5 — patrz `bridges/vibe-matrix-rs/README.md`. Raport zostaje jako historia.
+
 Wszystkie pliki przeczytane, `cargo build --workspace` i `cargo test --workspace` przechodzą (6 testów OK, tylko warningi o nieużywanym kodzie). Poniżej pełny raport.
 
 ---

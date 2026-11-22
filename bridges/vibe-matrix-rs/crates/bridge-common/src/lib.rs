@@ -1,19 +1,22 @@
 //! bridge-common: config z env, logging z redaction, czyszczenie ANSI.
 use anyhow::{Context, Result};
 use regex::Regex;
+use secrecy::SecretString;
 use std::collections::HashSet;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub homeserver: String,
-    pub token: String,
+    pub token: SecretString,
     pub room_id: String,
     pub bot_user_id: String,
     pub allowed_users: Vec<String>,
     pub vibe_cmd: String,
     pub vibe_timeout_secs: u64,
     pub sync_timeout_ms: u32,
+    pub inbound_max_per_min: u32,
+    pub max_seen_events: usize,
     pub state_file: String,
     pub session_file: String,
     pub agent_file: String,
@@ -36,32 +39,78 @@ impl Config {
             std::env::var(k).with_context(|| format!("brak zmiennej env {k}"))
         };
         let allowed = std::env::var("MATRIX_ALLOWED_USERS").unwrap_or_default();
-        let vibe_env_keys = std::env::var("VIBE_ENV_KEYS")
-            .unwrap_or_else(|_| "MISTRAL_API_KEY".to_string());
+        let vibe_env_keys =
+            std::env::var("VIBE_ENV_KEYS").unwrap_or_else(|_| "MISTRAL_API_KEY".to_string());
+        let homeserver = std::env::var("MATRIX_HOMESERVER")
+            .unwrap_or_else(|_| "https://matrix.owl-post.eu".to_string());
+        let allow_insecure = std::env::var("ALLOW_INSECURE_HTTP")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !allow_insecure && !homeserver.starts_with("https://") {
+            anyhow::bail!(
+                "MATRIX_HOMESERVER musi być https:// (token leci Bearerem); \
+                 ustaw ALLOW_INSECURE_HTTP=1 tylko świadomie, lokalnie"
+            );
+        }
         Ok(Self {
-            homeserver: std::env::var("MATRIX_HOMESERVER")
-                .unwrap_or_else(|_| "https://matrix.owl-post.eu".to_string()),
-            token: get("MATRIX_ACCESS_TOKEN")?,
+            homeserver,
+            token: SecretString::new(get("MATRIX_ACCESS_TOKEN")?.into()),
             room_id: get("MATRIX_ROOM_ID")?,
             bot_user_id: get("MATRIX_BOT_USER_ID")?,
-            allowed_users: allowed.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            allowed_users: allowed
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
             vibe_cmd: std::env::var("VIBE_CMD").unwrap_or_else(|_| "vibe".to_string()),
-            vibe_timeout_secs: std::env::var("VIBE_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(600),
-            sync_timeout_ms: std::env::var("SYNC_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30000),
-            state_file: std::env::var("STATE_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/seen.txt".to_string()),
-            session_file: std::env::var("SESSION_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/session.txt".to_string()),
-            agent_file: std::env::var("AGENT_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/agent.txt".to_string()),
-            tmux_prefix: std::env::var("TMUX_PREFIX").unwrap_or_else(|_| "vibe-matrix-rs".to_string()),
-            voice_file: std::env::var("VOICE_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/voice.txt".to_string()),
-            uploads_dir: std::env::var("UPLOADS_DIR").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/uploads".to_string()),
-            voice_dir: std::env::var("VOICE_DIR").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/voice".to_string()),
-            voice_fallback_secs: std::env::var("VOICE_FALLBACK_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(15),
-            agent_home: std::env::var("AGENT_HOME").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/agent-home".to_string()),
-            stt_model: std::env::var("STT_MODEL").unwrap_or_else(|_| "voxtral-mini-latest".to_string()),
-            tts_model: std::env::var("TTS_MODEL").unwrap_or_else(|_| "voxtral-mini-tts-latest".to_string()),
+            vibe_timeout_secs: std::env::var("VIBE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600),
+            sync_timeout_ms: std::env::var("SYNC_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30000),
+            inbound_max_per_min: std::env::var("INBOUND_MAX_PER_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6),
+            max_seen_events: std::env::var("MAX_SEEN_EVENTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100_000),
+            state_file: std::env::var("STATE_FILE")
+                .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/seen.txt".to_string()),
+            session_file: std::env::var("SESSION_FILE")
+                .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/session.txt".to_string()),
+            agent_file: std::env::var("AGENT_FILE")
+                .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/agent.txt".to_string()),
+            tmux_prefix: std::env::var("TMUX_PREFIX")
+                .unwrap_or_else(|_| "vibe-matrix-rs".to_string()),
+            voice_file: std::env::var("VOICE_FILE")
+                .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/voice.txt".to_string()),
+            uploads_dir: std::env::var("UPLOADS_DIR")
+                .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/uploads".to_string()),
+            voice_dir: std::env::var("VOICE_DIR")
+                .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/voice".to_string()),
+            voice_fallback_secs: std::env::var("VOICE_FALLBACK_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15),
+            agent_home: std::env::var("AGENT_HOME")
+                .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/agent-home".to_string()),
+            stt_model: std::env::var("STT_MODEL")
+                .unwrap_or_else(|_| "voxtral-mini-latest".to_string()),
+            tts_model: std::env::var("TTS_MODEL")
+                .unwrap_or_else(|_| "voxtral-mini-tts-latest".to_string()),
             tts_voice: std::env::var("TTS_VOICE").unwrap_or_else(|_| "gb_jane_neutral".to_string()),
-            vibe_workdir: std::env::var("VIBE_WORKDIR").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/vibe-work".to_string()),
-            vibe_env_keys: vibe_env_keys.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            vibe_workdir: std::env::var("VIBE_WORKDIR")
+                .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/vibe-work".to_string()),
+            vibe_env_keys: vibe_env_keys
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
         })
     }
 }
@@ -78,7 +127,9 @@ pub fn load_seen(path: &str) -> HashSet<String> {
     if let Ok(content) = std::fs::read_to_string(path) {
         for line in content.lines() {
             let l = line.trim();
-            if !l.is_empty() { set.insert(l.to_string()); }
+            if !l.is_empty() {
+                set.insert(l.to_string());
+            }
         }
     }
     set
@@ -166,7 +217,10 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         assert_eq!(load_session(p.to_str().unwrap()), None);
         save_session(p.to_str().unwrap(), "abc-123").unwrap();
-        assert_eq!(load_session(p.to_str().unwrap()), Some("abc-123".to_string()));
+        assert_eq!(
+            load_session(p.to_str().unwrap()),
+            Some("abc-123".to_string())
+        );
     }
 }
 
@@ -184,7 +238,9 @@ pub fn clean_ansi(input: &str) -> String {
     for line in s.lines() {
         if line.trim().is_empty() {
             blank += 1;
-            if blank > 1 { continue; }
+            if blank > 1 {
+                continue;
+            }
         } else {
             blank = 0;
         }
