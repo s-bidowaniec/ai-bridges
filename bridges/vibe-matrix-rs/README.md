@@ -41,3 +41,11 @@ journalctl -u vibe-matrix-rs -f
 - dzięki `--resume` vibe **pamięta poprzednie wiadomości** (tak jak tmux w wersji Python)
 - workdir vibe: `VIBE_WORKDIR` (default `/var/lib/vibe-matrix-rs/vibe-work`)
 - dodatkowo: bezpieczny `safe_truncate` (UTF-8 char boundary — nie panikuje na emoji), testy jednostkowe
+
+## Komendy (v3)
+- `/new` — reset sesji vibe (usuwa `SESSION_FILE`, następna wiadomość = nowy kontekst)
+- `/model` / `/model <nazwa>` — pokaż/ustaw model (`--model`, zapis w `MODEL_FILE`)
+- `/think` / `/think <off|low|medium|high|xhigh|max>` — pokaż/ustaw thinking (`--thinking`, zapis w `THINK_FILE`; vibe stosuje przy nowej sesji → użyj `/new`)
+- `/status` — pokój, sesja, model, think, liczba seen, uptime
+- `/help` — lista komend
+- nieznane `/coś` → odpowiedź „nieznana komenda” (NIE leci do agenta)

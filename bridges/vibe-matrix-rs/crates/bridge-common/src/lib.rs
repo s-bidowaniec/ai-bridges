@@ -16,6 +16,8 @@ pub struct Config {
     pub sync_timeout_ms: u32,
     pub state_file: String,
     pub session_file: String,
+    pub model_file: String,
+    pub think_file: String,
     pub vibe_workdir: String,
     pub vibe_env_keys: Vec<String>,
 }
@@ -40,6 +42,8 @@ impl Config {
             sync_timeout_ms: std::env::var("SYNC_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30000),
             state_file: std::env::var("STATE_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/seen.txt".to_string()),
             session_file: std::env::var("SESSION_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/session.txt".to_string()),
+            model_file: std::env::var("MODEL_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/model.txt".to_string()),
+            think_file: std::env::var("THINK_FILE").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/think.txt".to_string()),
             vibe_workdir: std::env::var("VIBE_WORKDIR").unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/vibe-work".to_string()),
             vibe_env_keys: vibe_env_keys.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
         })
@@ -83,10 +87,28 @@ pub fn load_session(path: &str) -> Option<String> {
 }
 
 pub fn save_session(path: &str, session_id: &str) -> Result<()> {
+    save_str(path, session_id)
+}
+
+/// Generyczny load opcjonalnego stringa z pliku (model/think/session).
+pub fn load_str_opt(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Generyczny zapis stringa do pliku stanu (tworzy katalogi).
+pub fn save_str(path: &str, val: &str) -> Result<()> {
     if let Some(dir) = Path::new(path).parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, format!("{session_id}\n")).context("zapis session_file")
+    std::fs::write(path, format!("{val}\n")).context("zapis pliku stanu")
+}
+
+/// Usuwa plik stanu (np. session.txt przy /new).
+pub fn remove_state_file(path: &str) {
+    let _ = std::fs::remove_file(path);
 }
 
 /// Bezpieczne obcięcie do `max` bajtów na granicy znaku UTF-8 (nie panikuje przy emoji/PL znakach).

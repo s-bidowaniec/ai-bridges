@@ -1,13 +1,55 @@
 //! bridge-headless: pętla sync Matrix -> `vibe -p --resume <session>` -> odpowiedź do pokoju.
-//! MVP Fazy 0+1 z ROADMAP-RUST.md (bez TUI/tmux, bez mediów, dedup przez plik).
-//! Sesja vibe jest kontynuowana między wiadomościami (`--resume`), żeby nie tracić kontekstu.
+//! MVP Fazy 0+1 z ROADMAP-RUST.md + komendy: /new /model /think /status /help.
+//! Sesja vibe kontynuowana między wiadomościami (`--resume`), żeby nie tracić kontekstu.
 use anyhow::{Context, Result};
-use bridge_common::{clean_ansi, load_seen, load_session, safe_truncate, save_seen, save_session, Config};
+use bridge_common::{
+    clean_ansi, load_seen, load_str_opt, remove_state_file, safe_truncate, save_seen, save_str,
+    Config,
+};
 use bridge_core::{Event, MatrixClient};
 use std::collections::HashSet;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
+
+#[derive(Debug, PartialEq)]
+enum BotCommand {
+    New,
+    Model(Option<String>),
+    Think(Option<String>),
+    Status,
+    Help,
+    Unknown(String),
+}
+
+/// Parsuje komendy `/...`; wiadomości niebędące komendą -> None (leci do agenta).
+fn parse_command(body: &str) -> Option<BotCommand> {
+    let body = body.trim();
+    if !body.starts_with('/') {
+        return None;
+    }
+    let mut parts = body.split_whitespace();
+    let cmd = parts.next()?;
+    let arg = parts.next();
+    Some(match cmd {
+        "/new" => BotCommand::New,
+        "/model" => BotCommand::Model(arg.map(|s| s.to_string())),
+        "/think" => BotCommand::Think(arg.map(|s| s.to_string())),
+        "/status" => BotCommand::Status,
+        "/help" | "/start" => BotCommand::Help,
+        other => BotCommand::Unknown(other.to_string()),
+    })
+}
+
+const HELP: &str = "🤖 Komendy bota:
+/new — nowa sesja vibe (reset kontekstu)
+/model — pokaż aktualny model
+/model <nazwa> — ustaw model (np. /model mistral-large-latest)
+/think — pokaż poziom myślenia
+/think <off|low|medium|high|xhigh|max> — ustaw thinking (działa od nowej sesji)
+/status — stan bota (pokój, sesja, model, seen)
+/help — ta lista
+Każda inna wiadomość leci do agenta vibe (sesja jest pamiętana między wiadomościami).";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,8 +61,11 @@ async fn main() -> Result<()> {
 
     let client = MatrixClient::new(&cfg.homeserver, &cfg.token, &cfg.room_id)?;
     let mut seen: HashSet<String> = load_seen(&cfg.state_file);
-    let mut session: Option<String> = load_session(&cfg.session_file);
+    let mut session: Option<String> = load_str_opt(&cfg.session_file);
+    let mut model: Option<String> = load_str_opt(&cfg.model_file);
+    let mut think: Option<String> = load_str_opt(&cfg.think_file);
     let mut since: Option<String> = None;
+    let started = Instant::now();
 
     // pierwszy sync: tylko najnowsze (bez since = od teraz), żeby nie przerabiać historii
     loop {
@@ -29,7 +74,12 @@ async fn main() -> Result<()> {
                 since = Some(resp.next_batch.clone());
                 if let Some(room) = resp.rooms.join.get(&cfg.room_id) {
                     for ev in &room.timeline.events {
-                        if let Err(e) = handle_event(&cfg, &client, ev, &mut seen, &mut session).await {
+                        if let Err(e) = handle_event(
+                            &cfg, &client, ev, &mut seen, &mut session, &mut model, &mut think,
+                            started,
+                        )
+                        .await
+                        {
                             tracing::error!(event = %ev.id, "błąd obsługi eventu: {e:#}");
                         }
                     }
@@ -46,12 +96,16 @@ async fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_event(
     cfg: &Config,
     client: &MatrixClient,
     ev: &Event,
     seen: &mut HashSet<String>,
     session: &mut Option<String>,
+    model: &mut Option<String>,
+    think: &mut Option<String>,
+    started: Instant,
 ) -> Result<()> {
     if ev.kind != "m.room.message" || ev.content.msgtype != "m.text" {
         return Ok(());
@@ -74,11 +128,57 @@ async fn handle_event(
     tracing::info!(event = %ev.id, sender = %ev.sender, "nowa wiadomość ({} znaków)", body.len());
     client.react(&ev.id, "👀").await.ok();
 
-    match run_vibe(cfg, body, session.as_deref()).await {
+    // komendy `/...` — nie lecą do agenta
+    if let Some(cmd) = parse_command(body) {
+        let reply = match cmd {
+            BotCommand::New => {
+                remove_state_file(&cfg.session_file);
+                *session = None;
+                "✅ Nowa sesja vibe — poprzedni kontekst zapomniany.".to_string()
+            }
+            BotCommand::Model(arg) => match arg {
+                None => format!("📌 Aktualny model: {}", model.as_deref().unwrap_or("(domyślny z configu vibe)")),
+                Some(m) => {
+                    *model = Some(m.clone());
+                    let _ = save_str(&cfg.model_file, &m);
+                    format!("✅ Model ustawiony na `{m}` (od następnej wiadomości)")
+                }
+            },
+            BotCommand::Think(arg) => match arg {
+                None => format!("🧠 Aktualny think: {}", think.as_deref().unwrap_or("(domyślny)")),
+                Some(t) => {
+                    *think = Some(t.clone());
+                    let _ = save_str(&cfg.think_file, &t);
+                    format!("✅ Thinking ustawiony na `{t}` (vibe применяет przy nowej sesji; zrób /new żeby wymusić)")
+                }
+            },
+            BotCommand::Status => {
+                let sess = session.as_deref().map(|s| &s[..s.len().min(8)]).unwrap_or("(brak)");
+                format!(
+                    "📊 Status:\n• pokój: {}\n• homeserver: {}\n• sesja vibe: {}…\n• model: {}\n• think: {}\n• przetworzone eventy (seen): {}\n• uptime: {:?}",
+                    cfg.room_id,
+                    cfg.homeserver,
+                    sess,
+                    model.as_deref().unwrap_or("(domyślny)"),
+                    think.as_deref().unwrap_or("(domyślny)"),
+                    seen.len(),
+                    started.elapsed()
+                )
+            }
+            BotCommand::Help => HELP.to_string(),
+            BotCommand::Unknown(c) => format!("❓ Nieznana komenda `{c}` — wpisz /help"),
+        };
+        let sent = client.send_text(&reply).await?;
+        tracing::info!(reply_event = %sent, "wysłano odpowiedź na komendę");
+        client.react(&ev.id, "✅").await.ok();
+        return Ok(());
+    }
+
+    match run_vibe(cfg, body, session.as_deref(), model.as_deref(), think.as_deref()).await {
         Ok((sid, text)) => {
             if !sid.is_empty() {
                 *session = Some(sid.clone());
-                if let Err(e) = save_session(&cfg.session_file, &sid) {
+                if let Err(e) = save_str(&cfg.session_file, &sid) {
                     tracing::warn!("nie udało się zapisać session: {e:#}");
                 }
             }
@@ -103,13 +203,25 @@ async fn handle_event(
     Ok(())
 }
 
-/// Uruchamia `vibe -p <prompt> --yolo --output json [--resume <session>]` z czystym env i timeoutem.
-/// Zwraca (session_id, tekst odpowiedzi). Przy kontynuacji sesji vibe pamięta kontekst.
-async fn run_vibe(cfg: &Config, prompt: &str, session: Option<&str>) -> Result<(String, String)> {
+/// Uruchamia `vibe -p <prompt> --yolo --output json [--resume <s>] [--model <m>] [--thinking <t>]`,
+/// czysty env, timeout. Zwraca (session_id, tekst odpowiedzi).
+async fn run_vibe(
+    cfg: &Config,
+    prompt: &str,
+    session: Option<&str>,
+    model: Option<&str>,
+    think: Option<&str>,
+) -> Result<(String, String)> {
     let mut cmd = Command::new(&cfg.vibe_cmd);
     cmd.arg("-p").arg(prompt).arg("--yolo").arg("--output").arg("json");
     if let Some(sid) = session {
         cmd.arg("--resume").arg(sid);
+    }
+    if let Some(m) = model {
+        cmd.arg("--model").arg(m);
+    }
+    if let Some(t) = think {
+        cmd.arg("--thinking").arg(t);
     }
     cmd.current_dir(&cfg.vibe_workdir)
         .env_clear()
@@ -176,6 +288,22 @@ fn parse_vibe_json(s: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_commands() {
+        assert_eq!(parse_command("/new"), Some(BotCommand::New));
+        assert_eq!(parse_command("/model"), Some(BotCommand::Model(None)));
+        assert_eq!(
+            parse_command("/model mistral-large-latest"),
+            Some(BotCommand::Model(Some("mistral-large-latest".to_string())))
+        );
+        assert_eq!(parse_command("/think high"), Some(BotCommand::Think(Some("high".to_string()))));
+        assert_eq!(parse_command("/status"), Some(BotCommand::Status));
+        assert_eq!(parse_command("/help"), Some(BotCommand::Help));
+        assert_eq!(parse_command("/foobar x"), Some(BotCommand::Unknown("/foobar".to_string())));
+        assert_eq!(parse_command("zwykła wiadomość"), None);
+        assert_eq!(parse_command("coś /new w środku"), None);
+    }
 
     #[test]
     fn parse_json_journal() {
