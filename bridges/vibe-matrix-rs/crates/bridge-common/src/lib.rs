@@ -24,6 +24,32 @@ pub fn terminal_cmd_from(env_val: Option<String>) -> TerminalCmd {
     }
 }
 
+/// Fail-fast: pusta allowlist = każdy członek pokoju steruje agentem na hoście (send-keys do tmux).
+/// Wymagamy świadomego opt-outu przez ALLOW_OPEN_ROOM=1.
+pub fn validate_allowed_users(allowed: &[String], allow_open_room: bool) -> Result<()> {
+    if allowed.is_empty() && !allow_open_room {
+        anyhow::bail!(
+            "MATRIX_ALLOWED_USERS jest puste — mostek daje pełną kontrolę nad terminalem agenta \
+             każdemu w pokoju. Ustaw allowlistę MXID (oddzielone przecinkami) albo świadomie \
+             ALLOW_OPEN_ROOM=1 (pokój publiczny = każdy może kazać agentowi wykonywać komendy)."
+        );
+    }
+    Ok(())
+}
+
+/// VIBE_ENV_KEYS leci do procesu agenta — sekrety mostka (MATRIX_*) nie mogą tam trafić.
+pub fn validate_env_keys(keys: &[String]) -> Result<()> {
+    for k in keys {
+        if k.to_ascii_uppercase().starts_with("MATRIX_") {
+            anyhow::bail!(
+                "VIBE_ENV_KEYS nie może zawierać `{k}` — sekrety mostka Matrix \
+                 (np. MATRIX_ACCESS_TOKEN) nie mogą lecieć do procesu agenta"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub homeserver: String,
@@ -62,6 +88,21 @@ impl Config {
         let allowed = std::env::var("MATRIX_ALLOWED_USERS").unwrap_or_default();
         let vibe_env_keys =
             std::env::var("VIBE_ENV_KEYS").unwrap_or_else(|_| "MISTRAL_API_KEY".to_string());
+        let allowed: Vec<String> = allowed
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let allow_open_room = std::env::var("ALLOW_OPEN_ROOM")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        validate_allowed_users(&allowed, allow_open_room).context("konfiguracja")?;
+        let vibe_env_keys: Vec<String> = vibe_env_keys
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        validate_env_keys(&vibe_env_keys).context("konfiguracja VIBE_ENV_KEYS")?;
         let homeserver = std::env::var("MATRIX_HOMESERVER")
             .unwrap_or_else(|_| "https://matrix.owl-post.eu".to_string());
         let allow_insecure = std::env::var("ALLOW_INSECURE_HTTP")
@@ -78,11 +119,7 @@ impl Config {
             token: SecretString::new(get("MATRIX_ACCESS_TOKEN")?.into()),
             room_id: get("MATRIX_ROOM_ID")?,
             bot_user_id: get("MATRIX_BOT_USER_ID")?,
-            allowed_users: allowed
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
+            allowed_users: allowed,
             vibe_cmd: std::env::var("VIBE_CMD").unwrap_or_else(|_| "vibe".to_string()),
             vibe_timeout_secs: std::env::var("VIBE_TIMEOUT_SECS")
                 .ok()
@@ -144,11 +181,7 @@ impl Config {
             tts_voice: std::env::var("TTS_VOICE").unwrap_or_else(|_| "gb_jane_neutral".to_string()),
             vibe_workdir: std::env::var("VIBE_WORKDIR")
                 .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/vibe-work".to_string()),
-            vibe_env_keys: vibe_env_keys
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
+            vibe_env_keys,
             terminal_cmd: terminal_cmd_from(std::env::var("TERMINAL_CMD").ok()),
         })
     }
@@ -247,6 +280,20 @@ mod tests {
     fn ansi_clean() {
         assert_eq!(clean_ansi("\x1b[31mhello\x1b[0m"), "hello");
         assert_eq!(clean_ansi("a\n\n\n\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn allowed_users_required_unless_opt_out() {
+        assert!(validate_allowed_users(&[], false).is_err());
+        assert!(validate_allowed_users(&[], true).is_ok());
+        assert!(validate_allowed_users(&["@a:x".to_string()], false).is_ok());
+    }
+
+    #[test]
+    fn env_keys_reject_matrix_secrets() {
+        assert!(validate_env_keys(&["MISTRAL_API_KEY".to_string()]).is_ok());
+        assert!(validate_env_keys(&["MATRIX_ACCESS_TOKEN".to_string()]).is_err());
+        assert!(validate_env_keys(&["matrix_token".to_string()]).is_err());
     }
 
     #[test]

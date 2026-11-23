@@ -132,6 +132,13 @@ Bridge tylko przekazuje audio między Matrix a terminalem agenta ( który ma wł
 - fix: m.audio NIE może mieć m.relates_to (Synapse 400) — voice odpowiedzi poza wątkiem, tekst w wątku
 - E2E test OK: m.audio -> voice/in -> fallback 15s -> STT -> vibe -> TTS -> m.audio (MSC3245 voice) w pokoju
 
+## Bezpieczeństwo (hardening po review ryzyk)
+- `MATRIX_ALLOWED_USERS` **wymagana** — przy pustej allowlistze mostek odmawia startu (chyba że świadomie `ALLOW_OPEN_ROOM=1`): mostek = send-keys do terminala agenta, więc każdy w pokoju miałby do niego dostęp
+- `VIBE_ENV_KEYS` nie może zawierać kluczy `MATRIX_*` — sekrety mostka nigdy nie lecą do procesu agenta (`env_clear` + whitelist + walidacja)
+- download media (`m.audio`) ma twardy limit **25 MB** (`MAX_MEDIA_BYTES` w bridge-core: check `Content-Length` + cap podczas streamu) — ochrona przed DoS dużym plikiem w pokoju
+- komendy tmux używają exact match (`-t =<sesja>`), żeby prefiksowe dopasowanie tmux nie złapało obcej sesji
+- token w `SecretString`, homeserver wymuszony `https://` (chyba że `ALLOW_INSECURE_HTTP=1`)
+
 ## Trwałość sesji (fix "sesja otwiera się na nowo")
 - **tmux mode:** sesja dostaje `remain-on-exit on` — gdy agent w pane padnie/wyjdzie, sesja (i jej nazwa pod `tmux attach`) zostaje, a przy następnej wiadomości agent jest **respawnowany w tej samej sesji** (`respawn-pane -k`), zamiast cichego tworzenia nowej sesji bez kontekstu
 - **tmux socket:** wszystkie wywołania `tmux` mostka idą z `TMUX_TMPDIR` (default: katalog `tmux` obok `STATE_FILE`); bez tego przy `PrivateTmp=true` `tmux attach` z shella widziałby inny socket niż mostek. `pc-install/env.example` ustawia `AGENT_MODE=tmux` + `TMUX_TMPDIR=%h/.local/share/vibe-matrix-rs/tmux`

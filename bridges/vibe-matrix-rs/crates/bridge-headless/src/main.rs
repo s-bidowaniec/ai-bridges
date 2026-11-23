@@ -85,6 +85,12 @@ fn tmux_session(cfg: &Config, agent: &str) -> String {
     format!("{}-{}", cfg.tmux_prefix, agent)
 }
 
+/// Target sesji tmux z wymuszonym exact match (`=` przed nazwą) — bez tego tmux robi też
+/// dopasowanie prefiksowe i mógłby złapać inną sesję (np. `…-vibe2` przy `…-vibe`).
+fn tmux_target(session: &str) -> String {
+    format!("={session}")
+}
+
 /// Uruchamia `tmux ...` synchronicznie, zwraca stdout; błąd gdy exit != 0.
 /// Zawsze z TMUX_TMPDIR z configu — socket musi być współdzielony z shellem
 /// użytkownika (przy PrivateTmp=true domyślny /tmp serwisu byłby prywatny).
@@ -108,8 +114,9 @@ fn tmux(cfg: &Config, args: &[&str]) -> Result<String> {
 
 /// Czy sesja tmux istnieje.
 fn tmux_has_session(cfg: &Config, session: &str) -> bool {
+    let t = tmux_target(session);
     std::process::Command::new("tmux")
-        .args(["has-session", "-t", session])
+        .args(["has-session", "-t", t.as_str()])
         .env("TMUX_TMPDIR", &cfg.tmux_tmpdir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -121,8 +128,9 @@ fn tmux_has_session(cfg: &Config, session: &str) -> bool {
 
 /// Czy pane sesji jest martwy (agent wyszedł/padł, ale sesja żyje dzięki remain-on-exit).
 fn tmux_pane_dead(cfg: &Config, session: &str) -> bool {
+    let t = tmux_target(session);
     std::process::Command::new("tmux")
-        .args(["display-message", "-p", "-t", session, "#{pane_dead}"])
+        .args(["display-message", "-p", "-t", t.as_str(), "#{pane_dead}"])
         .env("TMUX_TMPDIR", &cfg.tmux_tmpdir)
         .stdin(Stdio::null())
         .output()
@@ -133,8 +141,9 @@ fn tmux_pane_dead(cfg: &Config, session: &str) -> bool {
 /// Zapewnia żyjącą sesję tmux z agentem. Sesja NIGDY nie jest cicho kasowana i tworzona od nowa:
 /// jeśli istnieje, ale pane jest martwy (agent się wysypał/wyszedł), agent jest respawnowany
 /// w tej samej sesji — `tmux attach -t <sesja>` dalej pokazuje to samo okno.
-fn ensure_session(cfg: &Config, agent: &str) -> Result<String> {
+async fn ensure_session(cfg: &Config, agent: &str) -> Result<String> {
     let session = tmux_session(cfg, agent);
+    let t = tmux_target(&session);
     let cmd = agent_cmd(agent)
         .with_context(|| format!("nieznany agent `{agent}` (vibe|codex|claude|agy)"))?;
     if !tmux_has_session(cfg, &session) {
@@ -157,10 +166,16 @@ fn ensure_session(cfg: &Config, agent: &str) -> Result<String> {
         // sesja ma przetrwać wyjście agenta — wtedy respawn poniżej
         let _ = tmux(
             cfg,
-            &["set-window-option", "-t", &session, "remain-on-exit", "on"],
+            &[
+                "set-window-option",
+                "-t",
+                t.as_str(),
+                "remain-on-exit",
+                "on",
+            ],
         );
         // poczekaj aż agent wystartuje
-        std::thread::sleep(Duration::from_secs(3));
+        tokio::time::sleep(Duration::from_secs(3)).await;
         // mostek sam otwiera okno terminala podpięte do tej sesji (użytkownik tylko czyta/pisze)
         open_terminal_window(cfg, &session);
     } else if tmux_pane_dead(cfg, &session) {
@@ -171,13 +186,13 @@ fn ensure_session(cfg: &Config, agent: &str) -> Result<String> {
                 "respawn-pane",
                 "-k",
                 "-t",
-                &session,
+                t.as_str(),
                 "-c",
                 &cfg.vibe_workdir,
                 cmd.as_str(),
             ],
         )?;
-        std::thread::sleep(Duration::from_secs(3));
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
     Ok(session)
 }
@@ -258,19 +273,22 @@ fn open_terminal_window(cfg: &Config, session: &str) {
 }
 
 fn kill_session(cfg: &Config, agent: &str) {
-    let _ = tmux(cfg, &["kill-session", "-t", &tmux_session(cfg, agent)]);
+    let t = tmux_target(&tmux_session(cfg, agent));
+    let _ = tmux(cfg, &["kill-session", "-t", t.as_str()]);
 }
 
 /// Wysyła tekst do sesji tmux (literal + Enter).
 fn tmux_send(cfg: &Config, session: &str, text: &str) -> Result<()> {
-    tmux(cfg, &["send-keys", "-t", session, "-l", text])?;
-    tmux(cfg, &["send-keys", "-t", session, "Enter"])?;
+    let t = tmux_target(session);
+    tmux(cfg, &["send-keys", "-t", t.as_str(), "-l", text])?;
+    tmux(cfg, &["send-keys", "-t", t.as_str(), "Enter"])?;
     Ok(())
 }
 
 /// Capture ostatnich linii ekranu (cała historia do -300).
 fn tmux_capture(cfg: &Config, session: &str) -> Result<String> {
-    tmux(cfg, &["capture-pane", "-p", "-t", session, "-S", "-300"])
+    let t = tmux_target(session);
+    tmux(cfg, &["capture-pane", "-p", "-t", t.as_str(), "-S", "-300"])
 }
 
 /// Czeka na odpowiedź agenta: poll capture co 2s; koniec = 3 kolejne próbki bez zmian; max timeout.
@@ -471,7 +489,7 @@ async fn handle_event(
                     format!("✅ Agent ustawiony na `{agent}` (sesja tmux wystartuje przy następnej wiadomości)")
                 }
             }
-            BotCommand::Attach => match ensure_session(cfg, agent) {
+            BotCommand::Attach => match ensure_session(cfg, agent).await {
                 Ok(s) => match tmux_capture(cfg, &s) {
                     Ok(c) => {
                         let lines: Vec<&str> = c.lines().collect();
@@ -485,7 +503,7 @@ async fn handle_event(
                 },
                 Err(e) => format!("⚠️ tmux: {e:#}"),
             },
-            BotCommand::Window => match ensure_session(cfg, agent) {
+            BotCommand::Window => match ensure_session(cfg, agent).await {
                 Ok(s) => {
                     open_terminal_window(cfg, &s);
                     format!("🪟 Otwieram okno terminala dla sesji `{s}` (jeśli jest emulator; inaczej headless)")
@@ -741,7 +759,7 @@ fn discover_session_id(cfg: &Config, agent: &str) -> String {
 
 /// Wysyła prompt do sesji tmux agenta i czeka na odpowiedź (capture-pane). Zwraca nowy tekst ekranu.
 async fn run_agent_tmux(cfg: &Config, agent: &str, prompt: &str) -> Result<String> {
-    let session = ensure_session(cfg, agent)?;
+    let session = ensure_session(cfg, agent).await?;
     let prev = tmux_capture(cfg, &session).unwrap_or_default();
     tmux_send(cfg, &session, prompt)?;
     let reply = wait_reply(cfg, &session, &prev, cfg.vibe_timeout_secs).await;

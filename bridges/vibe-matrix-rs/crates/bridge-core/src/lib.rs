@@ -70,6 +70,19 @@ pub struct EventContent {
     pub info: Option<serde_json::Value>,
 }
 
+/// Maksymalny rozmiar pobieranego media (m.audio) — ochrona przed DoS dużym plikiem w pokoju.
+pub const MAX_MEDIA_BYTES: u64 = 25 * 1024 * 1024;
+
+/// Wstępny check rozmiaru po nagłówku Content-Length.
+fn check_media_size(content_length: Option<u64>) -> Result<()> {
+    if let Some(len) = content_length {
+        if len > MAX_MEDIA_BYTES {
+            anyhow::bail!("media za duże: {len} bajtów (max {MAX_MEDIA_BYTES})");
+        }
+    }
+    Ok(())
+}
+
 fn enc(s: &str) -> String {
     // percent-encode dla path (room id ma ! i :)
     let mut out = String::new();
@@ -222,6 +235,10 @@ impl MatrixClient {
                 .context("download: send v3")?
         };
         let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("download: HTTP {status}: {}", &body[..body.len().min(300)]);
+        }
         let mime = resp
             .headers()
             .get("content-type")
@@ -237,9 +254,23 @@ impl MatrixClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let bytes = resp.bytes().await.context("download: body")?.to_vec();
-        if !status.is_success() {
-            anyhow::bail!("download: HTTP {status} ({} bajtów)", bytes.len());
+        let clen = resp
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        check_media_size(clen)?;
+        // stream z twardym capem — sam Content-Length może być kłamstwem / może go nie być
+        let mut resp = resp;
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Some(chunk) = resp.chunk().await.context("download: chunk")? {
+            bytes.extend_from_slice(&chunk);
+            if bytes.len() as u64 > MAX_MEDIA_BYTES {
+                anyhow::bail!(
+                    "media przekroczyło limit {} bajtów podczas pobierania",
+                    MAX_MEDIA_BYTES
+                );
+            }
         }
         let filename = cd
             .split("filename=\"")
@@ -334,5 +365,24 @@ impl MatrixClient {
     ) -> Result<String> {
         self.send_audio_rel(body, mxc, mime, size, duration_ms, waveform, None)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_size_limit() {
+        assert!(check_media_size(None).is_ok()); // brak nagłówka = check w trakcie streamu
+        assert!(check_media_size(Some(1024)).is_ok());
+        assert!(check_media_size(Some(MAX_MEDIA_BYTES)).is_ok());
+        assert!(check_media_size(Some(MAX_MEDIA_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn enc_percent_encodes_room_id() {
+        assert_eq!(enc("!abc:example.org"), "%21abc%3Aexample.org");
+        assert_eq!(enc("plain-name_1.2~"), "plain-name_1.2~");
     }
 }
