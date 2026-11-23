@@ -481,26 +481,31 @@ async fn handle_event(
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum AgentMode {
-    /// vibe/codex/claude: headless `AGENT -p --resume <sid>` — szybko, bez menu TUI, kontekst w pliku sesji
+    /// headless `AGENT -p --resume <sid>` — tylko jako opt-in (AGENT_MODE=subprocess)
     Subprocess,
-    /// agy (Antigravity): żyje w tmux TUI (ma tryb voice) — send-keys + capture-pane
+    /// DOMYŚLNY: agent (vibe/codex/claude/agy) żyje jako pełne TUI w sesji tmux
+    /// <TMUX_PREFIX>-<agent> — send-keys + capture-pane; można się podpiąć `tmux attach`
+    /// i pisać ręcznie w tym samym oknie co Matrix. To główny tryb mostka.
     Tmux,
 }
 
 fn agent_mode(agent: &str) -> AgentMode {
-    // AGENT_MODE=tmux|subprocess wymusza tryb dla wszystkich agentów
-    // (tmux = agent żyje w sesji <TMUX_PREFIX>-<agent>, można się podpiąć `tmux attach` i pisać ręcznie).
-    if let Ok(m) = std::env::var("AGENT_MODE") {
+    let env_mode = std::env::var("AGENT_MODE").ok();
+    agent_mode_with(agent, env_mode.as_deref())
+}
+
+fn agent_mode_with(agent: &str, env_mode: Option<&str>) -> AgentMode {
+    // AGENT_MODE=tmux|subprocess wymusza tryb dla wszystkich agentów;
+    // default (bez zmiennej): WSZYSCY agenci w tmux — pełne okno terminala z natywnym TUI
+    if let Some(m) = env_mode {
         match m.to_ascii_lowercase().as_str() {
             "tmux" => return AgentMode::Tmux,
             "subprocess" | "oneshot" => return AgentMode::Subprocess,
             _ => {}
         }
     }
-    match agent.to_ascii_lowercase().as_str() {
-        "agy" | "antigravity" => AgentMode::Tmux,
-        _ => AgentMode::Subprocess,
-    }
+    let _ = agent;
+    AgentMode::Tmux
 }
 
 /// Dispatch per agent.
@@ -1111,5 +1116,26 @@ mod tests {
         let (sid, text) = parse_agent_json("nie-json");
         assert_eq!(sid, "");
         assert_eq!(text, "");
+    }
+
+    #[test]
+    fn agent_mode_defaults_to_tmux_for_all_agents() {
+        // główny tryb mostka: pełne okno TUI w tmux dla każdego natywnego agenta
+        for a in ["vibe", "codex", "claude", "agy", "antigravity"] {
+            assert_eq!(agent_mode_with(a, None), AgentMode::Tmux, "agent {a}");
+            assert_eq!(agent_mode_with(a, Some("")), AgentMode::Tmux, "agent {a}");
+            assert_eq!(agent_mode_with(a, Some("tmux")), AgentMode::Tmux);
+        }
+        // subprocess tylko jako opt-in
+        assert_eq!(
+            agent_mode_with("vibe", Some("subprocess")),
+            AgentMode::Subprocess
+        );
+        assert_eq!(
+            agent_mode_with("agy", Some("oneshot")),
+            AgentMode::Subprocess
+        );
+        // nieznana wartość -> też tmux (default)
+        assert_eq!(agent_mode_with("vibe", Some("cos-innego")), AgentMode::Tmux);
     }
 }

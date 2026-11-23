@@ -118,13 +118,14 @@ Bridge tylko przekazuje audio między Matrix a terminalem agenta ( który ma wł
 - Odpowiedzi z ekranu TUI są czyszczone (`clean_tui`): bez ramek ───, pasków `usage ██ 44%`,
   spinnerów i promptów — na Matrix leci sam tekst odpowiedzi.
 
-## v10 — AGENT_MODE=tmux dla wszystkich agentów (okno podpięte do Matrix, attach)
-- `AGENT_MODE=tmux` wymusza tryb tmux dla dowolnego agenta (vibe/codex/claude/agy); default bez zmiennej: agy=tmux, reszta=subprocess `--resume`
-- sesja tmux: `<TMUX_PREFIX>-<agent>` (np. `vibe-matrix-rs-vibe`) — `tmux attach -t vibe-matrix-rs-vibe` podpina Twoje okno do pokoju Matrix; wiadomości z Matrixa lecą jako send-keys, odpowiedzi jako capture-pane
-- **TMUX_TMPDIR pod $HOME** (np. `~/.local/state/vibe-matrix-rs/tmux`) — unit user ma `PrivateTmp=true`, więc bez tego socket tmux byłby w prywatnym /tmp i `tmux attach` z konsole by nie widział sesji; w shellu: `export TMUX_TMPDIR=$HOME/.local/state/vibe-matrix-rs/tmux`
+## v10 — tmux jako DOMYŚLNY tryb dla wszystkich agentów (główne zadanie mostka)
+- każdy natywny agent (vibe/codex/claude/agy) żyje jako **pełne okno TUI w sesji tmux** `<TMUX_PREFIX>-<agent>` (np. `vibe-matrix-rs-vibe`), połączony z pokojem Matrix: wiadomości z Matrixa lecą jako send-keys, odpowiedzi jako capture-pane
+- `tmux attach -t vibe-matrix-rs-vibe` podpina Twoje okno terminala do tego samego pokoju — piszesz ręcznie w tym samym oknie, co pisze mostek
+- `AGENT_MODE=subprocess|oneshot` = tylko opt-in: headless `AGENT -p --resume <sid> --yolo --output json` (bez okna TUI, sesja per agent w `<SESSION_FILE>.<agent>`); bez zmiennej env ZAWSZE tmux
+- **TMUX_TMPDIR** (default: katalog `tmux` obok `STATE_FILE`, np. `~/.local/state/vibe-matrix-rs/tmux`) — unit user ma `PrivateTmp=true`, więc bez tego socket tmux byłby w prywatnym /tmp i `tmux attach` z konsole by nie widział sesji; w shellu: `export TMUX_TMPDIR=$HOME/.local/state/vibe-matrix-rs/tmux`
 
 ## v9 — dispatch per agent + fixy E2E (Faza 6 test)
-- vibe/codex/claude: subprocess `AGENT -p --resume <sid> --yolo --output json` (szybko, bez menu TUI; sesja per agent w `<SESSION_FILE>.<agent>`)
+- default: tmux TUI dla wszystkich agentów (v10); subprocess tylko przez `AGENT_MODE=subprocess` — tam działa też voice fallback
 - agy: tmux TUI (send-keys/capture-pane) — tam działa tryb voice
 - fix: media download v1 first (ten Synapse nie ma v3 download), HOME agenta = AGENT_HOME (nie /root)
 - fix: m.audio NIE może mieć m.relates_to (Synapse 400) — voice odpowiedzi poza wątkiem, tekst w wątku
