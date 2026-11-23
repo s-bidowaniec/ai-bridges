@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use bridge_common::{
     clean_tui, load_seen, load_str_opt, remove_state_file, safe_truncate, save_seen, save_str,
-    Config,
+    Config, TerminalCmd,
 };
 use bridge_core::{Event, MatrixClient};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -17,6 +17,7 @@ enum BotCommand {
     New(Option<String>),
     Agent(String),
     Attach,
+    Window,
     Stop,
     Voice(Option<String>),
     Status,
@@ -38,6 +39,7 @@ fn parse_command(body: &str) -> Option<BotCommand> {
             .map(|a| BotCommand::Agent(a.to_string()))
             .unwrap_or(BotCommand::Help),
         "/attach" => BotCommand::Attach,
+        "/window" => BotCommand::Window,
         "/stop" => BotCommand::Stop,
         "/voice" => BotCommand::Voice(arg.map(|s| s.to_string())),
         "/status" => BotCommand::Status,
@@ -50,6 +52,7 @@ const HELP: &str = "🤖 Komendy bridge'a:
 /new [agent] — zabij sesję tmux i zacznij nową (agent: vibe|codex|claude|agy)
 /agent <vibe|codex|claude|agy> — przełącz agenta (nowa sesja tmux przy następnej wiadomości)
 /attach — pokaż ostatnie linie ekranu agenta (capture-pane)
+/window — otwórz ponownie okno terminala z sesją agenta (mostek sam otwiera terminal)
 /stop — zabij sesję tmux agenta
 /voice — status trybu głosowego
 /voice on|off — odpowiadaj głosem (TTS) też na tekstowe
@@ -158,6 +161,8 @@ fn ensure_session(cfg: &Config, agent: &str) -> Result<String> {
         );
         // poczekaj aż agent wystartuje
         std::thread::sleep(Duration::from_secs(3));
+        // mostek sam otwiera okno terminala podpięte do tej sesji (użytkownik tylko czyta/pisze)
+        open_terminal_window(cfg, &session);
     } else if tmux_pane_dead(cfg, &session) {
         tracing::warn!(session = %session, agent = %agent, "pane martwy — respawn agenta w istniejącej sesji tmux");
         tmux(
@@ -175,6 +180,81 @@ fn ensure_session(cfg: &Config, agent: &str) -> Result<String> {
         std::thread::sleep(Duration::from_secs(3));
     }
     Ok(session)
+}
+
+/// Ścieżka do binarki w PATH (z bitem wykonywalnym).
+fn which(bin: &str) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in path.split(':') {
+        let p = format!("{dir}/{bin}");
+        if let Ok(md) = std::fs::metadata(&p) {
+            if md.is_file() && md.permissions().mode() & 0o111 != 0 {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Komenda otwierająca okno terminala: TERMINAL_CMD (np. "konsole -e") albo auto-detect emulatora.
+fn terminal_cmd_parts(cfg: &Config) -> Option<Vec<String>> {
+    match &cfg.terminal_cmd {
+        TerminalCmd::Disabled => None,
+        TerminalCmd::Cmd(v) => Some(v.clone()),
+        TerminalCmd::Auto => {
+            // bez sesji graficznej (headless VPS) nie ma sensu otwierać okna
+            if std::env::var("DISPLAY").is_err() && std::env::var("WAYLAND_DISPLAY").is_err() {
+                return None;
+            }
+            for (bin, prefix) in [
+                ("konsole", &["-e"][..]),
+                ("gnome-terminal", &["--"][..]),
+                ("kgx", &["-e"][..]),
+                ("xterm", &["-e"][..]),
+                ("alacritty", &["-e"][..]),
+                ("wezterm", &["start", "--"][..]),
+                ("foot", &[][..]),
+                ("kitty", &[][..]),
+            ] {
+                if let Some(path) = which(bin) {
+                    let mut v = vec![path];
+                    v.extend(prefix.iter().map(|s| s.to_string()));
+                    return Some(v);
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Otwiera widoczne okno terminala podpięte do sesji tmux (`tmux attach -t <sesja>`).
+/// Sesja działa dalej headless mimo zamknięcia okna — Matrix widzi to samo co okno.
+fn open_terminal_window(cfg: &Config, session: &str) {
+    let Some(mut parts) = terminal_cmd_parts(cfg) else {
+        tracing::info!(session = %session, "brak emulatora terminala (TERMINAL_CMD) — sesja tmux headless");
+        return;
+    };
+    parts.extend(
+        ["tmux", "attach", "-t", session]
+            .iter()
+            .map(|s| s.to_string()),
+    );
+    match std::process::Command::new(&parts[0])
+        .args(&parts[1..])
+        .env("TMUX_TMPDIR", &cfg.tmux_tmpdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(_) => {
+            tracing::info!(session = %session, term = %parts[0], "otwarto okno terminala (tmux attach)")
+        }
+        Err(e) => {
+            tracing::warn!(session = %session, "nie udało się otworzyć okna terminala: {e:#}")
+        }
+    }
 }
 
 fn kill_session(cfg: &Config, agent: &str) {
@@ -403,6 +483,13 @@ async fn handle_event(
                     }
                     Err(e) => format!("⚠️ capture-pane: {e:#}"),
                 },
+                Err(e) => format!("⚠️ tmux: {e:#}"),
+            },
+            BotCommand::Window => match ensure_session(cfg, agent) {
+                Ok(s) => {
+                    open_terminal_window(cfg, &s);
+                    format!("🪟 Otwieram okno terminala dla sesji `{s}` (jeśli jest emulator; inaczej headless)")
+                }
                 Err(e) => format!("⚠️ tmux: {e:#}"),
             },
             BotCommand::Stop => {
@@ -1040,6 +1127,7 @@ mod tests {
             Some(BotCommand::Agent("agy".to_string()))
         );
         assert_eq!(parse_command("/attach"), Some(BotCommand::Attach));
+        assert_eq!(parse_command("/window"), Some(BotCommand::Window));
         assert_eq!(parse_command("/stop"), Some(BotCommand::Stop));
         assert_eq!(parse_command("/status"), Some(BotCommand::Status));
         assert_eq!(

@@ -120,7 +120,8 @@ Bridge tylko przekazuje audio między Matrix a terminalem agenta ( który ma wł
 
 ## v10 — tmux jako DOMYŚLNY tryb dla wszystkich agentów (główne zadanie mostka)
 - każdy natywny agent (vibe/codex/claude/agy) żyje jako **pełne okno TUI w sesji tmux** `<TMUX_PREFIX>-<agent>` (np. `vibe-matrix-rs-vibe`), połączony z pokojem Matrix: wiadomości z Matrixa lecą jako send-keys, odpowiedzi jako capture-pane
-- `tmux attach -t vibe-matrix-rs-vibe` podpina Twoje okno terminala do tego samego pokoju — piszesz ręcznie w tym samym oknie, co pisze mostek
+- **jedna sesja w dwóch miejscach naraz:** lokalnie `tmux attach -t vibe-matrix-rs-vibe` podpina Twoje normalne okno terminala do tego samego pokoju (piszesz ręcznie w tym samym oknie, co mostek); zdalnie (auto/telefon) piszesz przez Matrix/Element — mostek robi send-keys do tej samej sesji
+- mostek **sam otwiera okno terminala** przy starcie sesji (`tmux attach` w wykrytym emulatorze; `TERMINAL_CMD` wymusza/puste wyłącza; komenda `/window` otwiera ponownie) — zamknięcie okna nie zabija sesji (`remain-on-exit` + detached)
 - `AGENT_MODE=subprocess|oneshot` = tylko opt-in: headless `AGENT -p --resume <sid> --yolo --output json` (bez okna TUI, sesja per agent w `<SESSION_FILE>.<agent>`); bez zmiennej env ZAWSZE tmux
 - **TMUX_TMPDIR** (default: katalog `tmux` obok `STATE_FILE`, np. `~/.local/state/vibe-matrix-rs/tmux`) — unit user ma `PrivateTmp=true`, więc bez tego socket tmux byłby w prywatnym /tmp i `tmux attach` z konsole by nie widział sesji; w shellu: `export TMUX_TMPDIR=$HOME/.local/state/vibe-matrix-rs/tmux`
 

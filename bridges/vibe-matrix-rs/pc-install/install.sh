@@ -40,6 +40,17 @@ systemctl --user enable --now vibe-matrix-rs
 sleep 2
 systemctl --user status vibe-matrix-rs --no-pager | head -8
 echo
-echo "GOTOWE. W pokoju Matrix: /voice on  → nagrywaj voice messages → bot odpowiada głosem (ciągła konwersacja, kontekst w tmux)."
-echo "Logi: journalctl --user -u vibe-matrix-rs -f   |   Sesja agenta: tmux attach -t vibe-matrix-rs-vibe"
-echo "W shellu (żeby tmux attach widział sesję mostka): export TMUX_TMPDIR=\$HOME/.local/share/vibe-matrix-rs/tmux"
+echo "== dopisuję TMUX_TMPDIR do rc shella (lokalny 'tmux attach' musi widzieć ten sam socket co mostek)"
+TMUX_LINE='export TMUX_TMPDIR=$HOME/.local/share/vibe-matrix-rs/tmux'
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  if [ -f "$rc" ] && ! grep -qF 'TMUX_TMPDIR=$HOME/.local/share/vibe-matrix-rs/tmux' "$rc"; then
+    printf '\n# vibe-matrix-rs: socket tmux współdzielony z mostkiem (tmux attach widzi sesję agenta)\n%s\n' "$TMUX_LINE" >> "$rc"
+    echo "  dopisano do $rc"
+  fi
+done
+
+echo "GOTOWE. Jedna sesja agenta w dwóch miejscach naraz:"
+echo "  - lokalnie na PC:  tmux attach -t vibe-matrix-rs-vibe   (to samo okno, co czyta mostek; /window w pokoju otwiera je ponownie)"
+echo "  - zdalnie przez Matrix/Element: piszesz w pokoju, mostek robi send-keys do tej samej sesji"
+echo "W pokoju Matrix: /voice on  → voice messages → odpowiedzi głosem (ciągła konwersacja, kontekst w sesji)."
+echo "Logi: journalctl --user -u vibe-matrix-rs -f"

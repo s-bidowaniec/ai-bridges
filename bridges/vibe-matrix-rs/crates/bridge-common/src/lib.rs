@@ -5,6 +5,25 @@ use secrecy::SecretString;
 use std::collections::HashSet;
 use std::path::Path;
 
+/// Komenda otwierająca okno terminala (mostek sam otwiera terminal podpięty do sesji agenta).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TerminalCmd {
+    /// auto-detect emulatora (konsole/gnome-terminal/xterm/...) — tylko gdy jest DISPLAY/WAYLAND_DISPLAY
+    Auto,
+    /// wyłączone (TERMINAL_CMD puste) — mostek działa headless
+    Disabled,
+    /// konkretna komenda, np. "konsole -e"
+    Cmd(Vec<String>),
+}
+
+pub fn terminal_cmd_from(env_val: Option<String>) -> TerminalCmd {
+    match env_val {
+        None => TerminalCmd::Auto,
+        Some(s) if s.trim().is_empty() => TerminalCmd::Disabled,
+        Some(s) => TerminalCmd::Cmd(s.split_whitespace().map(|x| x.to_string()).collect()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub homeserver: String,
@@ -19,6 +38,7 @@ pub struct Config {
     pub max_seen_events: usize,
     pub state_file: String,
     pub tmux_tmpdir: String,
+    pub terminal_cmd: TerminalCmd,
     pub session_file: String,
     pub agent_file: String,
     pub tmux_prefix: String,
@@ -129,6 +149,7 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            terminal_cmd: terminal_cmd_from(std::env::var("TERMINAL_CMD").ok()),
         })
     }
 }
@@ -226,6 +247,17 @@ mod tests {
     fn ansi_clean() {
         assert_eq!(clean_ansi("\x1b[31mhello\x1b[0m"), "hello");
         assert_eq!(clean_ansi("a\n\n\n\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn terminal_cmd_parsing() {
+        assert_eq!(terminal_cmd_from(None), TerminalCmd::Auto);
+        assert_eq!(terminal_cmd_from(Some("".into())), TerminalCmd::Disabled);
+        assert_eq!(terminal_cmd_from(Some("   ".into())), TerminalCmd::Disabled);
+        assert_eq!(
+            terminal_cmd_from(Some("konsole -e".into())),
+            TerminalCmd::Cmd(vec!["konsole".to_string(), "-e".to_string()])
+        );
     }
 
     #[test]
