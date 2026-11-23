@@ -141,7 +141,154 @@ pub async fn create(config: &Config, name: &str, agent: &str) -> Result<()> {
         ])
         .await?,
     )?;
+    if let Err(error) = open_window(name).await {
+        tracing::warn!(session = %name, %error, "nie udało się automatycznie otworzyć okna terminala");
+    }
     Ok(())
+}
+
+fn find_in_path(bin: &str) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(bin);
+        if let Ok(meta) = std::fs::metadata(&candidate) {
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                return candidate.to_str().map(str::to_owned);
+            }
+        }
+    }
+    None
+}
+
+fn terminal_command_from(
+    configured: Option<&str>,
+    has_display: bool,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<Vec<String>> {
+    if let Some(raw) = configured {
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "off" | "none" | "0" | "false"
+            )
+        {
+            return None;
+        }
+        if !trimmed.eq_ignore_ascii_case("auto") {
+            let parts: Vec<String> = trimmed.split_whitespace().map(str::to_owned).collect();
+            return (!parts.is_empty()).then_some(parts);
+        }
+    }
+    if !has_display {
+        return None;
+    }
+    for (bin, prefix) in [
+        ("konsole", &["-e"][..]),
+        ("gnome-terminal", &["--"][..]),
+        ("kgx", &["-e"][..]),
+        ("ptyxis", &["--"][..]),
+        ("alacritty", &["-e"][..]),
+        ("kitty", &[][..]),
+        ("wezterm", &["start", "--"][..]),
+        ("foot", &[][..]),
+        ("xterm", &["-e"][..]),
+    ] {
+        if let Some(path) = lookup(bin) {
+            let mut parts = vec![path];
+            parts.extend(prefix.iter().map(|arg| (*arg).to_owned()));
+            return Some(parts);
+        }
+    }
+    None
+}
+
+/// Opens a desktop terminal window attached to the given tmux session without
+/// leaking Matrix secrets into the GUI process. Returns `Ok(false)` on headless
+/// hosts or when `TERMINAL_CMD` is disabled.
+pub async fn open_window(name: &str) -> Result<bool> {
+    let configured = std::env::var("TERMINAL_CMD").ok();
+    let has_display =
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let Some(mut parts) = terminal_command_from(configured.as_deref(), has_display, find_in_path)
+    else {
+        return Ok(false);
+    };
+    let tmux_bin = find_in_path("tmux").unwrap_or_else(|| "tmux".to_owned());
+    parts.extend([
+        tmux_bin,
+        "-u".to_owned(),
+        "attach-session".to_owned(),
+        "-t".to_owned(),
+        format!("={name}"),
+    ]);
+
+    if let (Some(systemd_run), Some(_)) = (
+        find_in_path("systemd-run"),
+        std::env::var_os("DBUS_SESSION_BUS_ADDRESS"),
+    ) {
+        let mut cmd = Command::new(systemd_run);
+        cmd.env_clear();
+        for key in ["HOME", "USER", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.args(["--user", "--collect", "--quiet"]);
+        if let Ok(tmpdir) = std::env::var("TMUX_TMPDIR") {
+            if !tmpdir.is_empty() {
+                cmd.arg(format!("--property=Environment=TMUX_TMPDIR={tmpdir}"));
+            }
+        }
+        cmd.arg("--").args(&parts);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Ok(output) = cmd.output().await {
+            if output.status.success() {
+                tracing::info!(session = %name, term = %parts[0], "otwarto okno terminala przez systemd-run");
+                return Ok(true);
+            }
+            tracing::debug!(
+                session = %name,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "systemd-run nie powiódł się, próbuję bezpośrednio"
+            );
+        }
+    }
+
+    let mut cmd = Command::new(&parts[0]);
+    cmd.args(&parts[1..]).env_clear();
+    for key in [
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XAUTHORITY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "TMUX_TMPDIR",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("uruchomienie emulatora terminala `{}`", parts[0]))?;
+    tracing::info!(session = %name, term = %parts[0], "otwarto okno terminala (tmux attach)");
+    Ok(true)
 }
 
 pub async fn list(config: &Config, agent: &str) -> Result<Vec<String>> {
@@ -335,5 +482,21 @@ mod tests {
         assert!(missing_session(&out("can't find session: vibe-matrix-rs-a\n")));
         assert!(missing_session(&out("no server running on /tmp/tmux-1000/default\n")));
         assert!(!missing_session(&out("permission denied\n")));
+    }
+
+    #[test]
+    fn terminal_command_respects_disabled_custom_and_auto_modes() {
+        let lookup = |bin: &str| (bin == "konsole").then(|| "/usr/bin/konsole".to_owned());
+        assert_eq!(terminal_command_from(Some("off"), true, lookup), None);
+        assert_eq!(terminal_command_from(Some(""), true, lookup), None);
+        assert_eq!(terminal_command_from(None, false, lookup), None);
+        assert_eq!(
+            terminal_command_from(None, true, lookup),
+            Some(vec!["/usr/bin/konsole".to_owned(), "-e".to_owned()])
+        );
+        assert_eq!(
+            terminal_command_from(Some("kitty --single-instance"), false, lookup),
+            Some(vec!["kitty".to_owned(), "--single-instance".to_owned()])
+        );
     }
 }

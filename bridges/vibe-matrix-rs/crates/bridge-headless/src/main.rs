@@ -17,6 +17,7 @@ const HELP: &str = "Terminal projektu
 /sessions — lista terminali
 /open <nazwa> — wróć do działającego terminala
 /attach — pokaż ekran i włącz przekazywanie zmian
+/window — otwórz okno terminala na monitorze dla bieżącej sesji
 /detach — odłącz widok Matrix, zostaw terminal przy pracy
 /key <Enter|Escape|Up|Down|Left|Right|Tab|C-c> — wyślij klawisz
 /agent <vibe|codex|claude|agy> — wybierz domyślnego agenta
@@ -32,6 +33,7 @@ enum BridgeCommand<'a> {
     Agent(&'a str),
     Sessions,
     Attach,
+    Window,
     Detach,
     Status,
     Voice,
@@ -50,6 +52,7 @@ fn parse_command(body: &str) -> Result<Option<BridgeCommand<'_>>> {
         Some("/agent") => BridgeCommand::Agent(parts.next().context("użycie: /agent <agent>")?),
         Some("/sessions") => BridgeCommand::Sessions,
         Some("/attach") => BridgeCommand::Attach,
+        Some("/window") => BridgeCommand::Window,
         Some("/detach" | "/stop") => BridgeCommand::Detach,
         Some("/status") => BridgeCommand::Status,
         Some("/voice") => BridgeCommand::Voice,
@@ -188,6 +191,14 @@ impl Workspace {
                     "Widok `{name}` jest podłączony.\n{}",
                     visible_screen(&captured)
                 )
+            }
+            BridgeCommand::Window => {
+                let name = self.current_session(cfg).await?;
+                if terminal::open_window(&name).await? {
+                    format!("Otwarto okno terminala dla `{name}`.")
+                } else {
+                    format!("Brak sesji graficznej lub TERMINAL_CMD wyłączony — `{name}` działa w tle.")
+                }
             }
             BridgeCommand::Detach => {
                 self.follow.send_replace(None);
@@ -518,6 +529,11 @@ mod tests {
             parse_command("/detach").unwrap(),
             Some(BridgeCommand::Detach)
         );
+        assert_eq!(
+            parse_command("/window").unwrap(),
+            Some(BridgeCommand::Window)
+        );
+        assert!(parse_command("/window extra").is_err());
         assert!(parse_command("/new").is_err());
         assert!(parse_command("/open mapy extra").is_err());
         assert_eq!(parse_command("/model fast").unwrap(), None);
