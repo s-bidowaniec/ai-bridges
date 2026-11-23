@@ -390,31 +390,155 @@ pub async fn send_key(pane: &str, key: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetectedMenu {
+    pub count: usize,
+    pub selected: usize,
+}
+
+fn is_cursor_marker(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("❯ ")
+        || trimmed.starts_with("› ")
+        || trimmed.starts_with("▸ ")
+        || trimmed.starts_with("▶ ")
+        || trimmed.starts_with("● ")
+        || trimmed.starts_with("◉ ")
+}
+
+fn is_unselected_option(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("○ ") || trimmed.starts_with("◯ ") || trimmed.starts_with("[ ] ") {
+        return true;
+    }
+    // Numbered menu line like "2. Always allow" or "2) Always allow"
+    let bytes = trimmed.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_digit()
+        && matches!(bytes[1], b'.' | b')')
+        && bytes[2] == b' '
+}
+
+/// Detects an active TUI selection menu near the bottom of the cleaned screen.
+pub fn detect_menu(cleaned: &str) -> Option<DetectedMenu> {
+    let lines: Vec<&str> = cleaned.lines().collect();
+    let tail_start = lines.len().saturating_sub(25);
+    let tail = &lines[tail_start..];
+    let cursor_idx = tail.iter().rposition(|line| is_cursor_marker(line))?;
+
+    let mut start = cursor_idx;
+    while start > 0 && (is_cursor_marker(tail[start - 1]) || is_unselected_option(tail[start - 1]))
+    {
+        start -= 1;
+    }
+    let mut end = cursor_idx;
+    while end + 1 < tail.len()
+        && (is_cursor_marker(tail[end + 1]) || is_unselected_option(tail[end + 1]))
+    {
+        end += 1;
+    }
+    let count = end - start + 1;
+    if count < 2 {
+        return None;
+    }
+    Some(DetectedMenu {
+        count,
+        selected: cursor_idx - start + 1,
+    })
+}
+
+fn navigation_keys(current: usize, target: usize) -> Vec<&'static str> {
+    let mut keys = Vec::new();
+    if target > current {
+        keys.extend(std::iter::repeat_n("Down", target - current));
+    } else if target < current {
+        keys.extend(std::iter::repeat_n("Up", current - target));
+    }
+    keys.push("Enter");
+    keys
+}
+
+/// Selects a 1-based option in an active TUI menu by moving from the currently
+/// highlighted item (or item 1 if no cursor is detected) and pressing Enter.
+pub async fn pick_option(pane: &str, target: usize) -> Result<String> {
+    ensure!(
+        (1..=9).contains(&target),
+        "wybór opcji obsługuje numery 1–9"
+    );
+    let captured = capture(pane).await?;
+    let cleaned = clean_tui(&captured);
+    let current = match detect_menu(&cleaned) {
+        Some(menu) => {
+            ensure!(
+                target <= menu.count,
+                "menu ma tylko {} opcji (wybrano {})",
+                menu.count,
+                target
+            );
+            menu.selected
+        }
+        None => 1,
+    };
+    for key in navigation_keys(current, target) {
+        send_key(pane, key).await?;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    Ok(format!("Wybrano opcję {target}."))
+}
+
+fn menu_hint(cleaned: &str) -> Option<String> {
+    if let Some(menu) = detect_menu(cleaned) {
+        let choices = (1..=menu.count.min(9))
+            .map(|n| format!("/{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Some(format!("Wybór: {choices} · /ok (Enter) · /esc (Anuluj)"));
+    }
+    let last = cleaned.lines().rev().take(4).collect::<Vec<_>>().join(" ");
+    if last.contains("[y/N]")
+        || last.contains("[Y/n]")
+        || last.contains("(y/n)")
+        || last.contains("(Y/n)")
+    {
+        return Some("Odpowiedz: y / n · /ok (Enter) · /esc (Anuluj)".to_owned());
+    }
+    None
+}
+
 #[derive(Clone)]
 pub struct Follow {
     pub pane: String,
     pub baseline: String,
 }
 
-fn screen_delta(previous: &str, current: &str) -> String {
-    if let Some(suffix) = current.strip_prefix(previous) {
-        return clean_tui(suffix);
+fn screen_delta(previous_clean: &str, current_clean: &str) -> String {
+    if previous_clean == current_clean {
+        return String::new();
     }
-    let old: Vec<_> = previous.lines().collect();
-    let new: Vec<_> = current.lines().collect();
+    if let Some(suffix) = current_clean.strip_prefix(previous_clean) {
+        return suffix.trim().to_owned();
+    }
+    let old: Vec<_> = previous_clean.lines().collect();
+    let new: Vec<_> = current_clean.lines().collect();
     let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
     let overlap = (1..=old.len().min(new.len()))
         .rev()
         .find(|&count| old[old.len() - count..] == new[..count])
         .unwrap_or(0);
     let changed = &new[prefix.max(overlap)..];
-    clean_tui(&changed[changed.len().saturating_sub(80)..].join("\n"))
+    changed[changed.len().saturating_sub(80)..]
+        .join("\n")
+        .trim()
+        .to_owned()
 }
 
 pub async fn relay(client: MatrixClient, mut follow: watch::Receiver<Option<Follow>>) {
-    let mut updates = tokio::time::interval(Duration::from_secs(2));
+    let mut updates = tokio::time::interval(Duration::from_millis(1500));
     updates.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut target = None;
+    let mut target: Option<Follow> = None;
+    let mut pending_clean: Option<String> = None;
+    let mut dirty_since: Option<std::time::Instant> = None;
+
     loop {
         tokio::select! {
             biased;
@@ -422,7 +546,12 @@ pub async fn relay(client: MatrixClient, mut follow: watch::Receiver<Option<Foll
                 if change.is_err() {
                     break;
                 }
-                target = follow.borrow_and_update().clone();
+                target = follow.borrow_and_update().clone().map(|mut f| {
+                    f.baseline = clean_tui(&f.baseline);
+                    f
+                });
+                pending_clean = None;
+                dirty_since = None;
             }
             _ = updates.tick() => {
                 let Some(active) = &mut target else { continue };
@@ -431,26 +560,53 @@ pub async fn relay(client: MatrixClient, mut follow: watch::Receiver<Option<Foll
                     Err(error) => {
                         tracing::warn!(%error, "odłączam widok Matrix po utracie panelu");
                         target = None;
+                        pending_clean = None;
+                        dirty_since = None;
                         let _ = client.send_text("Panel tmux przestał być dostępny. Użyj /attach, aby podłączyć sesję.").await;
                         continue;
                     }
                 };
-                if follow.has_changed().unwrap_or(true) || captured == active.baseline {
+                if follow.has_changed().unwrap_or(true) {
                     continue;
                 }
-                let delta = screen_delta(&active.baseline, &captured);
+                let cleaned = clean_tui(&captured);
+                if cleaned == active.baseline {
+                    pending_clean = None;
+                    dirty_since = None;
+                    continue;
+                }
+                // Wait one tick for streaming output to settle (max 4.5s) so Matrix gets
+                // complete blocks instead of fragmented lines.
+                let now = std::time::Instant::now();
+                let first_dirty = *dirty_since.get_or_insert(now);
+                let settled = pending_clean.as_deref() == Some(cleaned.as_str());
+                if !settled && now.duration_since(first_dirty) < Duration::from_millis(4500) {
+                    pending_clean = Some(cleaned);
+                    continue;
+                }
+                let delta = screen_delta(&active.baseline, &cleaned);
                 if delta.is_empty() {
-                    active.baseline = captured;
+                    active.baseline = cleaned;
+                    pending_clean = None;
+                    dirty_since = None;
+                    continue;
+                }
+                let mut body = if delta.len() > 3700 {
+                    format!("{}…\n\n[Pozostały tekst w terminalu]", safe_truncate(&delta, 3700))
                 } else {
-                    let message = if delta.len() > 3800 {
-                        format!("{}…\n\n[Pozostały tekst w terminalu]", safe_truncate(&delta, 3800))
-                    } else {
-                        delta
-                    };
-                    match client.send_text(&message).await {
-                        Ok(_) => active.baseline = captured,
-                        Err(error) => tracing::warn!(%error, "nie udało się opublikować zmian terminala"),
+                    delta
+                };
+                if let Some(hint) = menu_hint(&cleaned) {
+                    body.push_str("\n\n");
+                    body.push_str(&hint);
+                }
+                match client.send_text(&body).await {
+                    Ok(_) => {
+                        active.baseline = cleaned;
+                        pending_clean = None;
+                        dirty_since = None;
                     }
+                    Err(error) => tracing::warn!(%error, "nie udało się opublikować zmian terminala"),
                 }
             }
         }
@@ -497,6 +653,34 @@ mod tests {
         assert_eq!(
             terminal_command_from(Some("kitty --single-instance"), false, lookup),
             Some(vec!["kitty".to_owned(), "--single-instance".to_owned()])
+        );
+    }
+
+    #[test]
+    fn menu_detection_and_navigation_work_for_numbered_and_radio_lists() {
+        let numbered = "Pozwolić?\n  1. Raz\n❯ 2. Zawsze\n  3. Nie\n";
+        assert_eq!(
+            detect_menu(numbered),
+            Some(DetectedMenu {
+                count: 3,
+                selected: 2
+            })
+        );
+        assert_eq!(navigation_keys(2, 3), vec!["Down", "Enter"]);
+        assert_eq!(navigation_keys(2, 1), vec!["Up", "Enter"]);
+        assert_eq!(navigation_keys(2, 2), vec!["Enter"]);
+        assert_eq!(
+            menu_hint(numbered).as_deref(),
+            Some("Wybór: /1 /2 /3 · /ok (Enter) · /esc (Anuluj)")
+        );
+
+        let radio = "Tryb:\n● Szybki\n○ Dokładny\n";
+        assert_eq!(
+            detect_menu(radio),
+            Some(DetectedMenu {
+                count: 2,
+                selected: 1
+            })
         );
     }
 }

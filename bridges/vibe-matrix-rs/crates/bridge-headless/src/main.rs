@@ -4,7 +4,9 @@ mod terminal;
 mod voice;
 
 use anyhow::{bail, Context, Result};
-use bridge_common::{load_str_opt, private_directory, safe_truncate, save_str, Config, SeenEvents};
+use bridge_common::{
+    clean_tui, load_str_opt, private_directory, safe_truncate, save_str, Config, SeenEvents,
+};
 use bridge_core::{Event, MatrixClient};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -19,6 +21,8 @@ const HELP: &str = "Terminal projektu
 /attach — pokaż ekran i włącz przekazywanie zmian
 /window — otwórz okno terminala na monitorze dla bieżącej sesji
 /detach — odłącz widok Matrix, zostaw terminal przy pracy
+/1 … /9 (albo /pick <n>) — wybierz opcję z menu wyboru w terminalu
+/ok (/enter), /esc (/cancel), /up, /down, /tab, /ctrlc — szybkie klawisze
 /key <Enter|Escape|Up|Down|Left|Right|Tab|C-c> — wyślij klawisz
 /agent <vibe|codex|claude|agy> — wybierz domyślnego agenta
 /voice — pokaż tryb obsługi plików głosowych
@@ -30,6 +34,7 @@ enum BridgeCommand<'a> {
     New(&'a str, Option<&'a str>),
     Open(&'a str),
     Key(&'a str),
+    Pick(usize),
     Agent(&'a str),
     Sessions,
     Attach,
@@ -49,6 +54,26 @@ fn parse_command(body: &str) -> Result<Option<BridgeCommand<'_>>> {
         ),
         Some("/open") => BridgeCommand::Open(parts.next().context("użycie: /open <nazwa>")?),
         Some("/key") => BridgeCommand::Key(parts.next().context("użycie: /key <klawisz>")?),
+        Some("/pick") => {
+            let n: usize = parts
+                .next()
+                .context("użycie: /pick <1-9>")?
+                .parse()
+                .context("numer opcji musi być liczbą 1–9")?;
+            anyhow::ensure!((1..=9).contains(&n), "numer opcji musi być w zakresie 1–9");
+            BridgeCommand::Pick(n)
+        }
+        Some("/esc" | "/cancel") => BridgeCommand::Key("Escape"),
+        Some("/ok" | "/enter") => BridgeCommand::Key("Enter"),
+        Some("/up") => BridgeCommand::Key("Up"),
+        Some("/down") => BridgeCommand::Key("Down"),
+        Some("/tab") => BridgeCommand::Key("Tab"),
+        Some("/ctrlc") => BridgeCommand::Key("C-c"),
+        Some(cmd) if cmd.len() == 2 && cmd.starts_with('/') && cmd.as_bytes()[1].is_ascii_digit() => {
+            let n = (cmd.as_bytes()[1] - b'0') as usize;
+            anyhow::ensure!((1..=9).contains(&n), "numer opcji musi być w zakresie /1–/9");
+            BridgeCommand::Pick(n)
+        }
         Some("/agent") => BridgeCommand::Agent(parts.next().context("użycie: /agent <agent>")?),
         Some("/sessions") => BridgeCommand::Sessions,
         Some("/attach") => BridgeCommand::Attach,
@@ -209,6 +234,10 @@ impl Workspace {
                 terminal::send_key(&pane, key).await?;
                 return Ok(String::new());
             }
+            BridgeCommand::Pick(option) => {
+                let (pane, _) = self.attach(cfg, false).await?;
+                terminal::pick_option(&pane, option).await?
+            }
             BridgeCommand::Agent(agent) => {
                 let agent = terminal::agent_name(agent);
                 anyhow::ensure!(
@@ -248,7 +277,8 @@ impl Workspace {
 }
 
 fn visible_screen(captured: &str) -> String {
-    let lines: Vec<_> = captured.trim_end().lines().collect();
+    let cleaned = clean_tui(captured);
+    let lines: Vec<_> = cleaned.trim_end().lines().collect();
     let tail = lines[lines.len().saturating_sub(40)..].join("\n");
     safe_truncate(&tail, 3400).to_owned()
 }
@@ -533,6 +563,20 @@ mod tests {
             parse_command("/window").unwrap(),
             Some(BridgeCommand::Window)
         );
+        assert_eq!(parse_command("/2").unwrap(), Some(BridgeCommand::Pick(2)));
+        assert_eq!(
+            parse_command("/pick 3").unwrap(),
+            Some(BridgeCommand::Pick(3))
+        );
+        assert_eq!(
+            parse_command("/esc").unwrap(),
+            Some(BridgeCommand::Key("Escape"))
+        );
+        assert_eq!(
+            parse_command("/ok").unwrap(),
+            Some(BridgeCommand::Key("Enter"))
+        );
+        assert!(parse_command("/0").is_err());
         assert!(parse_command("/window extra").is_err());
         assert!(parse_command("/new").is_err());
         assert!(parse_command("/open mapy extra").is_err());

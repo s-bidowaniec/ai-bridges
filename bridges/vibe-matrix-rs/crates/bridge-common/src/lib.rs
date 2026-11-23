@@ -449,38 +449,59 @@ fn collapse_blanks(s: &str) -> String {
 
 /// Czyści zrzut ekranu TUI agenta (capture-pane) do czytelnego tekstu na Matrix:
 /// - ANSI/control (clean_ansi)
-/// - linie czysto z box-drawing / separatorów (─── │ ┌─┐)
+/// - linie czysto z box-drawing / separatorów (─── │ ┌─┐) oraz banery ASCII/blokowe
 /// - status bary: zawierające bloki/procenty/„usage"/„ctx"/model (np. `usage ██▋ 44% · PAYG · ctx ▁ 2%`)
-/// - spinnery (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ● ○ ◐ etc.) i „Thought"/„⏵" markery
-/// - końcowy prompt (`>`, `›`, `❯` jako osobna linia)
+/// - podpowiedzi skrótów TUI (`esc to cancel`, `? for shortcuts`, `↑/↓ to navigate`, itp.)
+/// - spinnery animacji (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ◐◓◑◒◕) i „Thought"/„⏵" markery (zachowuje radio `●`/`○`!)
+/// - końcowy pusty prompt (`>`, `›`, `❯` jako osobna linia)
 pub fn clean_tui(input: &str) -> String {
     let s = clean_ansi(input);
     // box-drawing U+2500–257F + block elements U+2580–259F + whitespace
     let re_boxline = Regex::new(r"^[\s\u{2500}-\u{259F}]+$").unwrap();
-    // linia = same box-drawing/whitespace (separator ────, ramki)
     let re_status = Regex::new(
-        r"(usage\s|ctx\s|PAYG|\d+\s?%|Mistral|OpenAI|Codex \(|Antigravity CLI|Gemini \d|Claude Code|vibe \d|codex-cli|agy \d)",
+        r"(?i)(usage\s|ctx\s|PAYG|\d+\s?%|Mistral|OpenAI|Codex \(|Antigravity CLI|Gemini \d|Claude Code|vibe \d|codex-cli|agy \d)",
     )
     .unwrap();
-    let re_spinner = Regex::new(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏●○◐◓◑◒◕]").unwrap();
+    // Tylko prawdziwe spinnery — NIE usuwamy ● / ○, bo służą do list wyboru i punktów!
+    let re_spinner = Regex::new(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒◕]").unwrap();
     let re_prompt = Regex::new(r"^[>›❯#\$]\s*$").unwrap();
     let re_marker = Regex::new(r"^(⏵|▼|▶)\s*(Thought|Rzecz|Myśl)\s*$").unwrap();
+    let re_tui_hint = Regex::new(
+        r"(?i)(\besc(ape)?\s+to\s+(cancel|interrupt|close|exit|abort)\b|\bctrl\+[a-z]\s+to\s+\w+|\?\s+for\s+shortcuts|\bshift\+tab\s+to\b|\benter\s+to\s+(confirm|select|submit|accept)\b|\b(↑/↓|up/down|arrow keys?)\s+to\s+(navigate|move|select)\b|\btab\s+to\s+(switch|cycle|toggle|autocomplete)\b)",
+    )
+    .unwrap();
+    let re_thinking_only = Regex::new(
+        r"(?i)^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒◕✳✶✻✽✢·•\s]*(thinking|working|processing|reasoning|generating|running|loading|waiting)\.{0,3}(\s*\([^)]*\))?\s*$",
+    )
+    .unwrap();
 
     let mut out_lines: Vec<String> = Vec::new();
     for line in s.lines() {
         let t = line.trim_end();
-        if t.trim().is_empty() {
+        let trimmed = t.trim();
+        if trimmed.is_empty() {
             out_lines.push(String::new());
             continue;
         }
         if re_boxline.is_match(t) {
             continue; // separator/ramka
         }
-        if re_prompt.is_match(t) {
-            continue; // sam prompt
+        if re_prompt.is_match(trimmed) {
+            continue; // sam pusty prompt
         }
-        if re_marker.is_match(t) {
+        if re_marker.is_match(trimmed) {
             continue; // zwinięty Thought
+        }
+        if re_tui_hint.is_match(trimmed) {
+            continue; // bezużyteczne na Matrix stopki typu "esc to cancel", "? for shortcuts"
+        }
+        if re_thinking_only.is_match(trimmed) {
+            continue; // przejściowe "Thinking... (4s)"
+        }
+        // Baner / logo z bloków (np. ▄▀▀▄ Antigravity CLI ...)
+        let art_blocks = t.chars().filter(|c| "▀▄█▌▐░▒▓".contains(*c)).count();
+        if art_blocks >= 3 {
+            continue;
         }
         // status bar / separator z opisem: linia z box-drawing + słowa statusu (model, usage, %, tryb)
         let boxchars = t
@@ -500,7 +521,7 @@ pub fn clean_tui(input: &str) -> String {
         if blocks >= 2 && t.contains('%') {
             continue;
         }
-        if re_spinner.is_match(t) && t.chars().count() < 40 {
+        if re_spinner.is_match(t) && t.chars().count() < 60 {
             continue; // sama spinnerowa linia
         }
         out_lines.push(t.to_string());
@@ -522,5 +543,31 @@ mod tui_tests {
         assert!(!out.contains('⏵'), "out={out:?}");
         assert!(!out.contains("Mistral"), "out={out:?}");
         assert!(!out.trim_end().ends_with('>'), "out={out:?}");
+    }
+
+    #[test]
+    fn clean_tui_strips_hints_and_keeps_selection_options() {
+        let pane = "\
+      ▄▀▀▄        Antigravity CLI 1.5.14
+     ▀▀▀▀▀▀       user@example.com
+  ⠋ Thinking... (4s · esc to cancel)
+  Wybierz opcję:
+  ❯ 1. Tak, zezwól raz
+    2. Zawsze zezwalaj
+    3. Odrzuć
+  ● Opcja A
+  ○ Opcja B
+  Use ↑/↓ to navigate · Enter to confirm · Esc to cancel
+  ? for shortcuts                                 auto · Gemini 4 Neon · high
+";
+        let out = clean_tui(pane);
+        assert!(!out.contains("Antigravity CLI"), "out={out:?}");
+        assert!(!out.contains("Thinking"), "out={out:?}");
+        assert!(!out.contains("esc to cancel"), "out={out:?}");
+        assert!(!out.contains("for shortcuts"), "out={out:?}");
+        assert!(out.contains("❯ 1. Tak, zezwól raz"), "out={out:?}");
+        assert!(out.contains("2. Zawsze zezwalaj"), "out={out:?}");
+        assert!(out.contains("● Opcja A"), "out={out:?}");
+        assert!(out.contains("○ Opcja B"), "out={out:?}");
     }
 }
