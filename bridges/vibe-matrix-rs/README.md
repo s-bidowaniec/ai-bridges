@@ -129,3 +129,9 @@ Bridge tylko przekazuje audio między Matrix a terminalem agenta ( który ma wł
 - fix: media download v1 first (ten Synapse nie ma v3 download), HOME agenta = AGENT_HOME (nie /root)
 - fix: m.audio NIE może mieć m.relates_to (Synapse 400) — voice odpowiedzi poza wątkiem, tekst w wątku
 - E2E test OK: m.audio -> voice/in -> fallback 15s -> STT -> vibe -> TTS -> m.audio (MSC3245 voice) w pokoju
+
+## Trwałość sesji (fix "sesja otwiera się na nowo")
+- **tmux mode:** sesja dostaje `remain-on-exit on` — gdy agent w pane padnie/wyjdzie, sesja (i jej nazwa pod `tmux attach`) zostaje, a przy następnej wiadomości agent jest **respawnowany w tej samej sesji** (`respawn-pane -k`), zamiast cichego tworzenia nowej sesji bez kontekstu
+- **tmux socket:** wszystkie wywołania `tmux` mostka idą z `TMUX_TMPDIR` (default: katalog `tmux` obok `STATE_FILE`); bez tego przy `PrivateTmp=true` `tmux attach` z shella widziałby inny socket niż mostek. `pc-install/env.example` ustawia `AGENT_MODE=tmux` + `TMUX_TMPDIR=%h/.local/share/vibe-matrix-rs/tmux`
+- **subprocess mode:** `sessionId` nie zawsze jest w `--output json` (vibe 2.x go nie ma) — mostek bierze sid też z najnowszej sesji w `$AGENT_HOME/.vibe/logs/session/*/meta.json` dla `VIBE_WORKDIR`; parser obsługuje tablicę wiadomości (content = string lub bloki), pojedynczy obiekt i NDJSON
+- **self-heal:** gdy `--resume <sid>` kończy się błędem (stary/nieznany sid), mostek czyści plik sid i próbuje raz bez `--resume`; `/new` czyści też plik sid agenta (obok kill-session tmux)

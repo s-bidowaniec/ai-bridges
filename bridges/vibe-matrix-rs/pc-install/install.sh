@@ -21,7 +21,7 @@ else
 fi
 
 echo "== 3/5 config (env z tokenami)"
-mkdir -p "$CONF_DIR" "$STATE_DIR" "$STATE_DIR/uploads" "$STATE_DIR/vibe-work"
+mkdir -p "$CONF_DIR" "$STATE_DIR" "$STATE_DIR/uploads" "$STATE_DIR/vibe-work" "$STATE_DIR/tmux"
 if [ ! -f "$CONF_DIR/env" ]; then
   sed "s|%h|$HOME|g" pc-install/env.example > "$CONF_DIR/env"
   chmod 600 "$CONF_DIR/env"
@@ -42,3 +42,4 @@ systemctl --user status vibe-matrix-rs --no-pager | head -8
 echo
 echo "GOTOWE. W pokoju Matrix: /voice on  → nagrywaj voice messages → bot odpowiada głosem (ciągła konwersacja, kontekst w tmux)."
 echo "Logi: journalctl --user -u vibe-matrix-rs -f   |   Sesja agenta: tmux attach -t vibe-matrix-rs-vibe"
+echo "W shellu (żeby tmux attach widział sesję mostka): export TMUX_TMPDIR=\$HOME/.local/share/vibe-matrix-rs/tmux"

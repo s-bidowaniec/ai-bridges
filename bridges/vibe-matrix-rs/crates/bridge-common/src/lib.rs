@@ -18,6 +18,7 @@ pub struct Config {
     pub inbound_max_per_min: u32,
     pub max_seen_events: usize,
     pub state_file: String,
+    pub tmux_tmpdir: String,
     pub session_file: String,
     pub agent_file: String,
     pub tmux_prefix: String,
@@ -79,8 +80,25 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100_000),
-            state_file: std::env::var("STATE_FILE")
-                .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/seen.txt".to_string()),
+            state_file: {
+                let sf = std::env::var("STATE_FILE")
+                    .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/seen.txt".to_string());
+                sf
+            },
+            // Socket tmux: przy PrivateTmp=true w unitcie bez tego tmux lądowałby
+            // w prywatnym /tmp serwisu i `tmux attach` z shella by go nie widział.
+            // Default: katalog `tmux` obok STATE_FILE (zawsze w ReadWritePaths).
+            tmux_tmpdir: std::env::var("TMUX_TMPDIR")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    let sf = std::env::var("STATE_FILE")
+                        .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/seen.txt".to_string());
+                    Path::new(&sf)
+                        .parent()
+                        .map(|p| p.join("tmux").to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "/tmp".to_string())
+                }),
             session_file: std::env::var("SESSION_FILE")
                 .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/session.txt".to_string()),
             agent_file: std::env::var("AGENT_FILE")
@@ -289,8 +307,16 @@ pub fn clean_tui(input: &str) -> String {
             continue; // zwinięty Thought
         }
         // status bar / separator z opisem: linia z box-drawing + słowa statusu (model, usage, %, tryb)
-        let boxchars = t.chars().filter(|c| ('\u{2500}'..='\u{259F}').contains(c)).count();
-        if boxchars >= 4 && (re_status.is_match(t) || t.contains('%') || t.contains("usage") || t.contains("ctx")) {
+        let boxchars = t
+            .chars()
+            .filter(|c| ('\u{2500}'..='\u{259F}').contains(c))
+            .count();
+        if boxchars >= 4
+            && (re_status.is_match(t)
+                || t.contains('%')
+                || t.contains("usage")
+                || t.contains("ctx"))
+        {
             continue;
         }
         // pasek użycia typu `usage ██▋ 44% · PAYG · ctx ▁ 2%` (bloki + %)

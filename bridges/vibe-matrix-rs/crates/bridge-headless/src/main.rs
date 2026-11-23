@@ -3,7 +3,8 @@
 //! Komendy bota: /new [agent] /agent <n> /attach /stop /status /help; reszta (np. /model) leci do tmuxa.
 use anyhow::{Context, Result};
 use bridge_common::{
-    clean_tui, load_seen, load_str_opt, safe_truncate, save_seen, save_str, Config,
+    clean_tui, load_seen, load_str_opt, remove_state_file, safe_truncate, save_seen, save_str,
+    Config,
 };
 use bridge_core::{Event, MatrixClient};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -82,9 +83,12 @@ fn tmux_session(cfg: &Config, agent: &str) -> String {
 }
 
 /// Uruchamia `tmux ...` synchronicznie, zwraca stdout; błąd gdy exit != 0.
-fn tmux(args: &[&str]) -> Result<String> {
+/// Zawsze z TMUX_TMPDIR z configu — socket musi być współdzielony z shellem
+/// użytkownika (przy PrivateTmp=true domyślny /tmp serwisu byłby prywatny).
+fn tmux(cfg: &Config, args: &[&str]) -> Result<String> {
     let out = std::process::Command::new("tmux")
         .args(args)
+        .env("TMUX_TMPDIR", &cfg.tmux_tmpdir)
         .stdin(Stdio::null())
         .output()
         .context("spawn tmux")?;
@@ -100,9 +104,10 @@ fn tmux(args: &[&str]) -> Result<String> {
 }
 
 /// Czy sesja tmux istnieje.
-fn tmux_has_session(session: &str) -> bool {
+fn tmux_has_session(cfg: &Config, session: &str) -> bool {
     std::process::Command::new("tmux")
         .args(["has-session", "-t", session])
+        .env("TMUX_TMPDIR", &cfg.tmux_tmpdir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -111,51 +116,91 @@ fn tmux_has_session(session: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Zapewnia żyjącą sesję tmux z agentem (startuje jeśli nie ma).
+/// Czy pane sesji jest martwy (agent wyszedł/padł, ale sesja żyje dzięki remain-on-exit).
+fn tmux_pane_dead(cfg: &Config, session: &str) -> bool {
+    std::process::Command::new("tmux")
+        .args(["display-message", "-p", "-t", session, "#{pane_dead}"])
+        .env("TMUX_TMPDIR", &cfg.tmux_tmpdir)
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Zapewnia żyjącą sesję tmux z agentem. Sesja NIGDY nie jest cicho kasowana i tworzona od nowa:
+/// jeśli istnieje, ale pane jest martwy (agent się wysypał/wyszedł), agent jest respawnowany
+/// w tej samej sesji — `tmux attach -t <sesja>` dalej pokazuje to samo okno.
 fn ensure_session(cfg: &Config, agent: &str) -> Result<String> {
     let session = tmux_session(cfg, agent);
-    if !tmux_has_session(&session) {
-        let cmd = agent_cmd(agent)
-            .with_context(|| format!("nieznany agent `{agent}` (vibe|codex|claude|agy)"))?;
-        tmux(&[
-            "new-session",
-            "-d",
-            "-s",
-            &session,
-            "-c",
-            &cfg.vibe_workdir,
-            cmd.as_str(),
-        ])?;
+    let cmd = agent_cmd(agent)
+        .with_context(|| format!("nieznany agent `{agent}` (vibe|codex|claude|agy)"))?;
+    if !tmux_has_session(cfg, &session) {
+        tmux(
+            cfg,
+            &[
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-c",
+                &cfg.vibe_workdir,
+                "-x",
+                "200",
+                "-y",
+                "50",
+                cmd.as_str(),
+            ],
+        )?;
+        // sesja ma przetrwać wyjście agenta — wtedy respawn poniżej
+        let _ = tmux(
+            cfg,
+            &["set-window-option", "-t", &session, "remain-on-exit", "on"],
+        );
         // poczekaj aż agent wystartuje
+        std::thread::sleep(Duration::from_secs(3));
+    } else if tmux_pane_dead(cfg, &session) {
+        tracing::warn!(session = %session, agent = %agent, "pane martwy — respawn agenta w istniejącej sesji tmux");
+        tmux(
+            cfg,
+            &[
+                "respawn-pane",
+                "-k",
+                "-t",
+                &session,
+                "-c",
+                &cfg.vibe_workdir,
+                cmd.as_str(),
+            ],
+        )?;
         std::thread::sleep(Duration::from_secs(3));
     }
     Ok(session)
 }
 
 fn kill_session(cfg: &Config, agent: &str) {
-    let _ = tmux(&["kill-session", "-t", &tmux_session(cfg, agent)]);
+    let _ = tmux(cfg, &["kill-session", "-t", &tmux_session(cfg, agent)]);
 }
 
 /// Wysyła tekst do sesji tmux (literal + Enter).
-fn tmux_send(session: &str, text: &str) -> Result<()> {
-    tmux(&["send-keys", "-t", session, "-l", text])?;
-    tmux(&["send-keys", "-t", session, "Enter"])?;
+fn tmux_send(cfg: &Config, session: &str, text: &str) -> Result<()> {
+    tmux(cfg, &["send-keys", "-t", session, "-l", text])?;
+    tmux(cfg, &["send-keys", "-t", session, "Enter"])?;
     Ok(())
 }
 
 /// Capture ostatnich linii ekranu (cała historia do -300).
-fn tmux_capture(session: &str) -> Result<String> {
-    tmux(&["capture-pane", "-p", "-t", session, "-S", "-300"])
+fn tmux_capture(cfg: &Config, session: &str) -> Result<String> {
+    tmux(cfg, &["capture-pane", "-p", "-t", session, "-S", "-300"])
 }
 
 /// Czeka na odpowiedź agenta: poll capture co 2s; koniec = 3 kolejne próbki bez zmian; max timeout.
-async fn wait_reply(session: &str, prev: &str, timeout_secs: u64) -> String {
+async fn wait_reply(cfg: &Config, session: &str, prev: &str, timeout_secs: u64) -> String {
     let mut last = prev.to_string();
     let mut stable = 0;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let cur = match tmux_capture(session) {
+        let cur = match tmux_capture(cfg, session) {
             Ok(c) => c,
             Err(_) => break, // sesja padła
         };
@@ -187,6 +232,7 @@ async fn main() -> Result<()> {
 
     std::fs::create_dir_all(&cfg.vibe_workdir).context("create vibe_workdir")?;
     std::fs::create_dir_all(&cfg.agent_home).context("create agent_home")?;
+    std::fs::create_dir_all(&cfg.tmux_tmpdir).context("create tmux_tmpdir")?;
 
     let client = MatrixClient::new(&cfg.homeserver, &cfg.token, &cfg.room_id)?;
     // watcher: pliki z voice/out/ -> m.audio na Matrix (tryb "konektor": terminal odpowiada głosem)
@@ -327,10 +373,12 @@ async fn handle_event(
                         *agent = a.to_ascii_lowercase();
                         let _ = save_str(&cfg.agent_file, agent);
                         kill_session(cfg, agent);
+                        remove_state_file(&session_file_for(cfg, agent));
                         format!("✅ Nowa sesja agenta `{agent}` (tmux)")
                     }
                 } else {
                     kill_session(cfg, agent);
+                    remove_state_file(&session_file_for(cfg, agent));
                     format!("✅ Sesja `{agent}` zabita — następna wiadomość zacznie nową")
                 }
             }
@@ -344,7 +392,7 @@ async fn handle_event(
                 }
             }
             BotCommand::Attach => match ensure_session(cfg, agent) {
-                Ok(s) => match tmux_capture(&s) {
+                Ok(s) => match tmux_capture(cfg, &s) {
                     Ok(c) => {
                         let lines: Vec<&str> = c.lines().collect();
                         let start = lines.len().saturating_sub(60);
@@ -363,7 +411,7 @@ async fn handle_event(
             }
             BotCommand::Status => {
                 let s = tmux_session(cfg, agent);
-                let alive = tmux_has_session(&s);
+                let alive = tmux_has_session(cfg, &s);
                 format!(
                     "📊 Status:\n• pokój: {}\n• agent: {agent} (tmux `{s}`, alive={alive})\n• voice: {}\n• homeserver: {}\n• seen: {} eventów\n• uptime: {:?}",
                     cfg.room_id, if *voice_on { "ON" } else { "OFF" }, cfg.homeserver, seen.len(), started.elapsed()
@@ -463,17 +511,63 @@ async fn run_agent(cfg: &Config, agent: &str, prompt: &str) -> Result<String> {
     }
 }
 
-/// Subprocess tryb: `vibe -p <prompt> --yolo --output json [--resume <sid>]`; sesja per agent w pliku.
+/// Plik z session id agenta (subprocess mode), per agent.
+fn session_file_for(cfg: &Config, agent: &str) -> String {
+    format!("{}.{}", cfg.session_file, agent)
+}
+
+/// Subprocess tryb: `AGENT -p <prompt> --yolo --output json [--resume <sid>]`; sesja per agent w pliku.
+/// Gdy zapisany sid jest martwy (np. `vibe --resume` exit 1 "Session not found"), czyścimy go
+/// i próbujemy raz jeszcze bez `--resume` — mostek sam wraca do życia zamiast błędować w kółko.
 async fn run_agent_subprocess(cfg: &Config, agent: &str, prompt: &str) -> Result<String> {
-    let sess_file = format!("{}.{}", cfg.session_file, agent);
+    let sess_file = session_file_for(cfg, agent);
     let sid = load_str_opt(&sess_file);
+    let mut out = run_agent_once(cfg, agent, prompt, sid.as_deref()).await?;
+    if !out.status.success() && sid.is_some() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        tracing::warn!(
+            agent = %agent,
+            sid = %sid.as_deref().unwrap_or(""),
+            "run z --resume nieudany (exit {:?}) — czyszczę sid i retry bez --resume: {}",
+            out.status.code(),
+            &stderr[..stderr.len().min(200)]
+        );
+        remove_state_file(&sess_file);
+        out = run_agent_once(cfg, agent, prompt, None).await?;
+    }
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "{agent} exit {:?}: {}",
+            out.status.code(),
+            &stderr[..stderr.len().min(500)]
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let (mut new_sid, text) = parse_agent_json(&stdout);
+    if new_sid.is_empty() {
+        new_sid = discover_session_id(cfg, agent);
+    }
+    if !new_sid.is_empty() {
+        let _ = save_str(&sess_file, &new_sid);
+    }
+    Ok(if text.is_empty() { stdout } else { text })
+}
+
+/// Jedno wywołanie agenta headless: `AGENT -p <prompt> --yolo --output json [--resume <sid>]`.
+async fn run_agent_once(
+    cfg: &Config,
+    agent: &str,
+    prompt: &str,
+    sid: Option<&str>,
+) -> Result<std::process::Output> {
     let mut cmd = Command::new(agent_cmd(agent).context("nieznany agent")?);
     cmd.arg("-p")
         .arg(prompt)
         .arg("--yolo")
         .arg("--output")
         .arg("json");
-    if let Some(s) = &sid {
+    if let Some(s) = sid {
         cmd.arg("--resume").arg(s);
     }
     let agent_path = std::env::var("AGENT_PATH")
@@ -503,32 +597,65 @@ async fn run_agent_subprocess(cfg: &Config, agent: &str, prompt: &str) -> Result
     .await
     .context("timeout agenta")?
     .context("wait agenta")?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!(
-            "{agent} exit {:?}: {}",
-            out.status.code(),
-            &stderr[..stderr.len().min(500)]
-        );
+    Ok(out)
+}
+
+/// vibe 2.x nie wystawia `sessionId` w `--output json` — bierzemy najnowszą sesję
+/// z katalogu `$AGENT_HOME/.vibe/logs/session/*/meta.json` pasującą do VIBE_WORKDIR
+/// (taki sam store, którego używa `vibe -c`). Best-effort: jak layout się zmieni, zwracamy "".
+fn discover_session_id(cfg: &Config, agent: &str) -> String {
+    if agent.to_ascii_lowercase() != "vibe" {
+        return String::new();
     }
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    match parse_vibe_json(&stdout) {
-        Some((sid, text)) if !text.is_empty() => {
-            if !sid.is_empty() {
-                let _ = save_str(&sess_file, &sid);
-            }
-            Ok(text)
+    let dir = format!("{}/.vibe/logs/session", cfg.agent_home);
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return String::new();
+    };
+    let workdir = std::fs::canonicalize(&cfg.vibe_workdir)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| cfg.vibe_workdir.clone());
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for e in rd.flatten() {
+        let Ok(meta) = std::fs::read_to_string(e.path().join("meta.json")) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta) else {
+            continue;
+        };
+        let wd = v
+            .get("environment")
+            .and_then(|e| e.get("working_directory"))
+            .and_then(|w| w.as_str())
+            .unwrap_or("");
+        let wd = std::fs::canonicalize(wd)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| wd.to_string());
+        if wd != workdir {
+            continue;
         }
-        _ => Ok(stdout),
+        let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) else {
+            continue;
+        };
+        let mtime = std::fs::metadata(e.path().join("messages.jsonl"))
+            .and_then(|m| m.modified())
+            .ok()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+            best = Some((mtime, sid.to_string()));
+        }
     }
+    best.map(|(_, s)| s).unwrap_or_default()
 }
 
 /// Wysyła prompt do sesji tmux agenta i czeka na odpowiedź (capture-pane). Zwraca nowy tekst ekranu.
 async fn run_agent_tmux(cfg: &Config, agent: &str, prompt: &str) -> Result<String> {
     let session = ensure_session(cfg, agent)?;
-    let prev = tmux_capture(&session).unwrap_or_default();
-    tmux_send(&session, prompt)?;
-    let reply = wait_reply(&session, &prev, cfg.vibe_timeout_secs).await;
+    let prev = tmux_capture(cfg, &session).unwrap_or_default();
+    tmux_send(cfg, &session, prompt)?;
+    let reply = wait_reply(cfg, &session, &prev, cfg.vibe_timeout_secs).await;
+    if !tmux_has_session(cfg, &session) {
+        anyhow::bail!("sesja tmux `{session}` zniknęła w trakcie odpowiedzi");
+    }
     Ok(reply)
 }
 
@@ -808,32 +935,88 @@ fn pseudo_waveform(_text_len: usize) -> Vec<u32> {
         .collect()
 }
 
-fn parse_vibe_json(s: &str) -> Option<(String, String)> {
-    let v: serde_json::Value = serde_json::from_str(s).ok()?;
-    let arr = v.as_array()?;
-    let sid = arr
-        .iter()
-        .find_map(|e| e.get("sessionId")?.as_str())
-        .unwrap_or("")
-        .to_string();
-    let mut text = String::new();
-    for e in arr.iter().rev() {
-        if e.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-            if let Some(content) = e.get("content").and_then(|c| c.as_array()) {
-                for c in content {
-                    if c.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
-                            text.push_str(t);
-                        }
-                    }
-                }
+/// Parsuje stdout agenta w `--output json`. Obsługiwane formaty:
+/// - tablica wiadomości (vibe 2.x: `[{role, content}, ...]`, content = string albo lista bloków)
+/// - pojedynczy obiekt / NDJSON po linii (vibe 3.x: wpisy historii z `sessionId` i zagnieżdżonym `message`)
+/// Zwraca (session_id, tekst ostatniej odpowiedzi assistant).
+fn parse_agent_json(s: &str) -> (String, String) {
+    let mut sid = String::new();
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+        collect_agent_json(v, &mut sid, &mut messages);
+    } else {
+        for line in s.lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                collect_agent_json(v, &mut sid, &mut messages);
             }
+        }
+    }
+    let mut text = String::new();
+    for m in messages.iter().rev() {
+        if m.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+            text = content_text(m.get("content"));
             if !text.is_empty() {
                 break;
             }
         }
     }
-    Some((sid, text))
+    (sid, text)
+}
+
+fn collect_agent_json(
+    v: serde_json::Value,
+    sid: &mut String,
+    messages: &mut Vec<serde_json::Value>,
+) {
+    match v {
+        serde_json::Value::Array(arr) => {
+            for e in arr {
+                collect_agent_json(e, sid, messages);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for key in ["sessionId", "session_id"] {
+                if sid.is_empty() {
+                    if let Some(s) = map.get(key).and_then(|x| x.as_str()) {
+                        sid.push_str(s);
+                    }
+                }
+            }
+            // vibe 3.x: wpis historii {type: "message", sessionId, message: {role, content}}
+            if let Some(msg) = map.get("message") {
+                if msg.get("role").is_some() {
+                    messages.push(msg.clone());
+                    return;
+                }
+            }
+            if map.get("role").is_some() {
+                messages.push(serde_json::Value::Object(map));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Tekst z pola `content`: string albo lista bloków `{type: "text"|"output_text", text}`.
+fn content_text(c: Option<&serde_json::Value>) -> String {
+    match c {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(arr)) => {
+            let mut t = String::new();
+            for b in arr {
+                if matches!(
+                    b.get("type").and_then(|x| x.as_str()),
+                    Some("text") | Some("output_text")
+                ) {
+                    if let Some(x) = b.get("text").and_then(|x| x.as_str()) {
+                        t.push_str(x);
+                    }
+                }
+            }
+            t
+        }
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -878,5 +1061,55 @@ mod tests {
         // AGY_CMD nieustawione w testach -> domyślne "agy" z PATH
         assert_eq!(agent_cmd("AGY").as_deref(), Some("agy"));
         assert_eq!(agent_cmd("nieznany"), None);
+    }
+
+    #[test]
+    fn parse_agent_json_vibe2_array_string_content() {
+        // vibe 2.x --output json: tablica LLMMessage, content jako string, bez sessionId
+        let s = r#"[
+            {"role": "user", "content": "cześć"},
+            {"role": "assistant", "content": "Cześć! W czym pomóc?"}
+        ]"#;
+        let (sid, text) = parse_agent_json(s);
+        assert_eq!(sid, "");
+        assert_eq!(text, "Cześć! W czym pomóc?");
+    }
+
+    #[test]
+    fn parse_agent_json_vibe2_block_content_last_assistant() {
+        let s = r#"[
+            {"role": "assistant", "content": [{"type": "text", "text": "pierwsza odpowiedź"}]},
+            {"role": "user", "content": "a teraz?"},
+            {"role": "assistant", "content": [{"type": "text", "text": "druga "}, {"type": "text", "text": "odpowiedź"}]}
+        ]"#;
+        let (_, text) = parse_agent_json(s);
+        assert_eq!(text, "druga odpowiedź");
+    }
+
+    #[test]
+    fn parse_agent_json_vibe3_entries_with_session_id() {
+        // vibe 3.x: wpisy historii (camelCase) z sessionId i zagnieżdżonym message
+        let s = r#"[
+            {"type": "message", "sessionId": "abc123-xyz", "message": {"role": "user", "content": "hej"}},
+            {"type": "message", "sessionId": "abc123-xyz", "message": {"role": "assistant", "content": [{"type": "text", "text": "OK"}]}}
+        ]"#;
+        let (sid, text) = parse_agent_json(s);
+        assert_eq!(sid, "abc123-xyz");
+        assert_eq!(text, "OK");
+    }
+
+    #[test]
+    fn parse_agent_json_ndjson_streaming() {
+        let s = "{\"type\":\"message\",\"session_id\":\"sid-1\",\"message\":{\"role\":\"assistant\",\"content\":\"stream odpowiedź\"}}\n{\"type\":\"notice\"}";
+        let (sid, text) = parse_agent_json(s);
+        assert_eq!(sid, "sid-1");
+        assert_eq!(text, "stream odpowiedź");
+    }
+
+    #[test]
+    fn parse_agent_json_garbage() {
+        let (sid, text) = parse_agent_json("nie-json");
+        assert_eq!(sid, "");
+        assert_eq!(text, "");
     }
 }
