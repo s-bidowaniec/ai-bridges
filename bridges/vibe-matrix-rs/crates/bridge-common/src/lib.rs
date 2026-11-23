@@ -232,7 +232,10 @@ pub fn clean_ansi(input: &str) -> String {
     let s = re_osc.replace_all(input, "");
     let s = re_csi.replace_all(&s, "");
     let s = re_ctrl.replace_all(&s, "");
-    // zwiń nadmiarowe puste linie
+    collapse_blanks(&s)
+}
+
+fn collapse_blanks(s: &str) -> String {
     let mut out = String::new();
     let mut blank = 0;
     for line in s.lines() {
@@ -248,4 +251,74 @@ pub fn clean_ansi(input: &str) -> String {
         out.push('\n');
     }
     out.trim_end().to_string()
+}
+
+/// Czyści zrzut ekranu TUI agenta (capture-pane) do czytelnego tekstu na Matrix:
+/// - ANSI/control (clean_ansi)
+/// - linie czysto z box-drawing / separatorów (─── │ ┌─┐)
+/// - status bary: zawierające bloki/procenty/„usage"/„ctx"/model (np. `usage ██▋ 44% · PAYG · ctx ▁ 2%`)
+/// - spinnery (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ● ○ ◐ etc.) i „Thought"/„⏵" markery
+/// - końcowy prompt (`>`, `›`, `❯` jako osobna linia)
+pub fn clean_tui(input: &str) -> String {
+    let s = clean_ansi(input);
+    // box-drawing U+2500–257F + block elements U+2580–259F + whitespace
+    let re_boxline = Regex::new(r"^[\s\u{2500}-\u{259F}]+$").unwrap();
+    // linia = same box-drawing/whitespace (separator ────, ramki)
+    let re_status = Regex::new(
+        r"(usage\s|ctx\s|PAYG|\d+\s?%|Mistral|OpenAI|Codex \(|Antigravity CLI|Gemini \d|Claude Code|vibe \d|codex-cli|agy \d)",
+    )
+    .unwrap();
+    let re_spinner = Regex::new(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏●○◐◓◑◒◕]").unwrap();
+    let re_prompt = Regex::new(r"^[>›❯#\$]\s*$").unwrap();
+    let re_marker = Regex::new(r"^(⏵|▼|▶)\s*(Thought|Rzecz|Myśl)\s*$").unwrap();
+
+    let mut out_lines: Vec<String> = Vec::new();
+    for line in s.lines() {
+        let t = line.trim_end();
+        if t.trim().is_empty() {
+            out_lines.push(String::new());
+            continue;
+        }
+        if re_boxline.is_match(t) {
+            continue; // separator/ramka
+        }
+        if re_prompt.is_match(t) {
+            continue; // sam prompt
+        }
+        if re_marker.is_match(t) {
+            continue; // zwinięty Thought
+        }
+        // status bar / separator z opisem: linia z box-drawing + słowa statusu (model, usage, %, tryb)
+        let boxchars = t.chars().filter(|c| ('\u{2500}'..='\u{259F}').contains(c)).count();
+        if boxchars >= 4 && (re_status.is_match(t) || t.contains('%') || t.contains("usage") || t.contains("ctx")) {
+            continue;
+        }
+        // pasek użycia typu `usage ██▋ 44% · PAYG · ctx ▁ 2%` (bloki + %)
+        let blocks = t.chars().filter(|c| "█▇▆▅▄▃▂▁".contains(*c)).count();
+        if blocks >= 2 && t.contains('%') {
+            continue;
+        }
+        if re_spinner.is_match(t) && t.chars().count() < 40 {
+            continue; // sama spinnerowa linia
+        }
+        out_lines.push(t.to_string());
+    }
+    collapse_blanks(&out_lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tui_tests {
+    use super::*;
+
+    #[test]
+    fn clean_tui_strips_chrome() {
+        let pane = "\n────────────────────────────\n⏵ Thought\n  OK-VIBE-4\n────────────────────────────────────────────\n>\n─\n~/.local/state/vibe-matrix-rs/vibe-work       usage ██▋    44% · PAYG · ctx ▁ 2%\n────────────────── Mistral Large 4[high] · accept edits · auto-approve ──\n";
+        let out = clean_tui(pane);
+        assert!(out.contains("OK-VIBE-4"), "out={out:?}");
+        assert!(!out.contains("44%"), "out={out:?}");
+        assert!(!out.contains('─'), "out={out:?}");
+        assert!(!out.contains('⏵'), "out={out:?}");
+        assert!(!out.contains("Mistral"), "out={out:?}");
+        assert!(!out.trim_end().ends_with('>'), "out={out:?}");
+    }
 }

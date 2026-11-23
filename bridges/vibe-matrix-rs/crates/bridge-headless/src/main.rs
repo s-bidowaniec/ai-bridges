@@ -3,7 +3,7 @@
 //! Komendy bota: /new [agent] /agent <n> /attach /stop /status /help; reszta (np. /model) leci do tmuxa.
 use anyhow::{Context, Result};
 use bridge_common::{
-    clean_ansi, load_seen, load_str_opt, safe_truncate, save_seen, save_str, Config,
+    clean_tui, load_seen, load_str_opt, safe_truncate, save_seen, save_str, Config,
 };
 use bridge_core::{Event, MatrixClient};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -72,6 +72,12 @@ fn agent_cmd(agent: &str) -> Option<String> {
 }
 
 fn tmux_session(cfg: &Config, agent: &str) -> String {
+    // TMUX_SESSION wymusza konkretną sesję (np. podpięcie już otwartego okna przez reptyr)
+    if let Ok(s) = std::env::var("TMUX_SESSION") {
+        if !s.is_empty() {
+            return s;
+        }
+    }
     format!("{}-{}", cfg.tmux_prefix, agent)
 }
 
@@ -401,7 +407,7 @@ async fn handle_event(
     // zwykła wiadomość (lub /komenda agenta typu /model) -> agent
     match run_agent(cfg, agent, body).await {
         Ok(text) => {
-            let clean = clean_ansi(&text);
+            let clean = clean_tui(&text);
             let reply = if clean.is_empty() {
                 "(agent zwrócił pustą odpowiedź — /attach żeby zobaczyć ekran)".to_string()
             } else if clean.len() > 3800 {
@@ -713,7 +719,7 @@ async fn handle_voice(
     let prompt = format!("[voice message od {}]: {}", ev.sender, text);
     match run_agent(cfg, agent, &prompt).await {
         Ok(reply) => {
-            let clean = clean_ansi(&reply);
+            let clean = clean_tui(&reply);
             let reply = if clean.is_empty() {
                 "(agent nic nie odpowiedział — /attach)".to_string()
             } else if clean.len() > 3800 {

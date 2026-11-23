@@ -105,6 +105,19 @@ Bridge tylko przekazuje audio między Matrix a terminalem agenta ( który ma wł
 - `/voice on|off|new` jak wcześniej; env: `VOICE_DIR`
 - uwaga: prawdziwy m.call (WebRTC) NIE jest potrzebny — rozmowa głosowa idzie przez voice messages + terminal
 
+## Podpinanie otwartych okien terminali do Matrix (v10+)
+- Agent w sesji tmux = automatycznie podpięty do pokoju: `tmux attach -t <TMUX_PREFIX>-<agent>`
+  pokazuje to samo okno, które czyta mostek (send-keys/capture-pane).
+- **TMUX_TMPDIR pod $HOME** jest wymagany (unit ma PrivateTmp) — w shellu:
+  `export TMUX_TMPDIR=$HOME/.local/state/vibe-matrix-rs/tmux`
+- Własna nazwa sesji zamiast `<prefix>-<agent>`: `TMUX_SESSION=<nazwa>` w env instancji.
+- Istniejące okno konsole: `tools/attach-window.py <PID> <sesja> --force` (reptyr -T) —
+  działa gdy ptrace jest dozwolone (ptrace_scope=0 i SELinux permissive); na Fedora Enforcing
+  dla okien konsole pomoże tylko sudo. Zalecane: odpalaj okna agentów od razu w tmux
+  (`tmux new -s aw-astra` w karcie konsole) — wtedy mostek i Twoje okno to jedna sesja.
+- Odpowiedzi z ekranu TUI są czyszczone (`clean_tui`): bez ramek ───, pasków `usage ██ 44%`,
+  spinnerów i promptów — na Matrix leci sam tekst odpowiedzi.
+
 ## v10 — AGENT_MODE=tmux dla wszystkich agentów (okno podpięte do Matrix, attach)
 - `AGENT_MODE=tmux` wymusza tryb tmux dla dowolnego agenta (vibe/codex/claude/agy); default bez zmiennej: agy=tmux, reszta=subprocess `--resume`
 - sesja tmux: `<TMUX_PREFIX>-<agent>` (np. `vibe-matrix-rs-vibe`) — `tmux attach -t vibe-matrix-rs-vibe` podpina Twoje okno do pokoju Matrix; wiadomości z Matrixa lecą jako send-keys, odpowiedzi jako capture-pane
