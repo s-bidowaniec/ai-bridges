@@ -434,6 +434,15 @@ enum AgentMode {
 }
 
 fn agent_mode(agent: &str) -> AgentMode {
+    // AGENT_MODE=tmux|subprocess wymusza tryb dla wszystkich agentów
+    // (tmux = agent żyje w sesji <TMUX_PREFIX>-<agent>, można się podpiąć `tmux attach` i pisać ręcznie).
+    if let Ok(m) = std::env::var("AGENT_MODE") {
+        match m.to_ascii_lowercase().as_str() {
+            "tmux" => return AgentMode::Tmux,
+            "subprocess" | "oneshot" => return AgentMode::Subprocess,
+            _ => {}
+        }
+    }
     match agent.to_ascii_lowercase().as_str() {
         "agy" | "antigravity" => AgentMode::Tmux,
         _ => AgentMode::Subprocess,

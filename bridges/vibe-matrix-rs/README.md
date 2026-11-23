@@ -105,6 +105,11 @@ Bridge tylko przekazuje audio między Matrix a terminalem agenta ( który ma wł
 - `/voice on|off|new` jak wcześniej; env: `VOICE_DIR`
 - uwaga: prawdziwy m.call (WebRTC) NIE jest potrzebny — rozmowa głosowa idzie przez voice messages + terminal
 
+## v10 — AGENT_MODE=tmux dla wszystkich agentów (okno podpięte do Matrix, attach)
+- `AGENT_MODE=tmux` wymusza tryb tmux dla dowolnego agenta (vibe/codex/claude/agy); default bez zmiennej: agy=tmux, reszta=subprocess `--resume`
+- sesja tmux: `<TMUX_PREFIX>-<agent>` (np. `vibe-matrix-rs-vibe`) — `tmux attach -t vibe-matrix-rs-vibe` podpina Twoje okno do pokoju Matrix; wiadomości z Matrixa lecą jako send-keys, odpowiedzi jako capture-pane
+- **TMUX_TMPDIR pod $HOME** (np. `~/.local/state/vibe-matrix-rs/tmux`) — unit user ma `PrivateTmp=true`, więc bez tego socket tmux byłby w prywatnym /tmp i `tmux attach` z konsole by nie widział sesji; w shellu: `export TMUX_TMPDIR=$HOME/.local/state/vibe-matrix-rs/tmux`
+
 ## v9 — dispatch per agent + fixy E2E (Faza 6 test)
 - vibe/codex/claude: subprocess `AGENT -p --resume <sid> --yolo --output json` (szybko, bez menu TUI; sesja per agent w `<SESSION_FILE>.<agent>`)
 - agy: tmux TUI (send-keys/capture-pane) — tam działa tryb voice
