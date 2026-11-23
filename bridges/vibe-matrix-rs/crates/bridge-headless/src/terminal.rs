@@ -80,10 +80,12 @@ fn check(action: &str, output: Output) -> Result<String> {
 
 fn missing_session(output: &Output) -> bool {
     let error = String::from_utf8_lossy(&output.stderr);
-    error.starts_with("can't find session:")
-        || error.starts_with("no server running on ")
-        || (error.starts_with("error connecting to ")
-            && error.contains("(No such file or directory)"))
+    let trimmed = error.trim();
+    trimmed == "no current target"
+        || trimmed.starts_with("can't find session:")
+        || trimmed.starts_with("no server running on ")
+        || (trimmed.starts_with("error connecting to ")
+            && trimmed.contains("(No such file or directory)"))
 }
 
 pub async fn session_exists(name: &str) -> Result<bool> {
@@ -319,5 +321,19 @@ mod tests {
         assert_eq!(screen_delta("one\ntwo", "one\nupdated"), "updated");
         assert_eq!(screen_delta("one\ntwo", "two"), "");
         assert_eq!(agent_name("Antigravity"), "agy");
+    }
+
+    #[test]
+    fn missing_session_recognizes_empty_tmux_daemon() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |err: &str| Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: err.as_bytes().to_vec(),
+        };
+        assert!(missing_session(&out("no current target\n")));
+        assert!(missing_session(&out("can't find session: vibe-matrix-rs-a\n")));
+        assert!(missing_session(&out("no server running on /tmp/tmux-1000/default\n")));
+        assert!(!missing_session(&out("permission denied\n")));
     }
 }
