@@ -12,6 +12,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+UMask=0077
 Type=simple
 EnvironmentFile=%h/.config/vibe-matrix-rs/%i.env
 ExecStart=%h/.local/bin/bridge-headless

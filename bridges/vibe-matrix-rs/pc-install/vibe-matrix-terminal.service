@@ -1,0 +1,11 @@
+[Unit]
+Description=Trwały serwer tmux dla terminali projektu Matrix
+
+[Service]
+Type=simple
+Environment=TMUX_TMPDIR=%h/.local/share/vibe-matrix-rs/tmux
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/tmux -D
+
+[Install]
+WantedBy=default.target

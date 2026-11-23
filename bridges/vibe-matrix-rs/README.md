@@ -1,131 +1,144 @@
-# vibe-matrix-rs (Rust MVP — Faza 0+1 z docs/ROADMAP-RUST.md)
+# Terminal projektu przez Matrix
 
-Mostek Matrix room ↔ `vibe -p --yolo` (headless), przepisany z `bridges/vibe-matrix` (Python).
+Bramka udostępnia żywe sesje tmux. W sesji działa natywny Vibe, Codex,
+Claude Code albo Antigravity. Program startuje w `VIBE_WORKDIR` i używa
+narzędzi oraz uprawnień swojego konta na hoście. W tej samej sesji można
+pracować w lokalnym oknie albo z telefonu przez Matrix.
 
-## Co działa w MVP
-- sync long-poll `/_matrix/client/v3/sync` (reqwest + Bearer, bez matrix-sdk — szybszy build)
-- allowlist nadawców (`MATRIX_ALLOWED_USERS`), własne wiadomości bota ignorowane
-- dedup eventów przez plik stanu (`STATE_FILE`, nadpisywany set — docelowo `redb`)
-- reakcje 👀 / ✅ / ❌ na wiadomość
-- subprocess `vibe -p <msg> --yolo` z `env_clear()` + whitelist (`VIBE_ENV_KEYS`), `kill_on_drop`, timeout
-- czyszczenie ANSI z odpowiedzi TUI (`clean_ansi`), limit 3800 znaków odpowiedzi
-- systemd unit z podstawowym hardeningiem
+## Szybki start
 
-## Env (pełna lista w `.env.example`)
-System: `/etc/vibe-matrix-rs.env` (lub `/etc/vibe-matrix-rs/<agent>.env` dla `@.service`),
-owner `root:vibe-matrix-rs`, **chmod 640**. User: `~/.config/vibe-matrix-rs/<agent>.env`, chmod 600.
+1. Na hoście zainstaluj tmux i wybrane CLI. Budowanie wymaga Rust 1.96 lub nowszego. Zaloguj natywne CLI jako konto,
+   które uruchamia tmux. Wybierz **prywatny pokój z włączonym E2EE**, z kontem
+   mostka i zaufanymi uczestnikami.
+2. Skonfiguruj konto i urządzenie mostka zgodnie z sekcją E2EE poniżej. Ustaw
+   `VIBE_WORKDIR` na katalog projektu. Na PC instalator
+   [pc-install/install.sh](pc-install/install.sh) przygotowuje usługi użytkownika
+   i oddzielny serwer tmux, dzięki czemu restart bramki pozostawia terminale.
+3. Na telefonie wpisz `/new mapy codex`. Lokalnie otwórz ten sam terminal:
+
+   ```bash
+   export TMUX_TMPDIR="$HOME/.local/share/vibe-matrix-rs/tmux"
+   tmux attach -t vibe-matrix-rs-mapy
+   ```
+
+   Użyj tego samego katalogu socketu, z którego korzysta bramka. Odłącz lokalne
+   okno przez `Ctrl-b d` albo zamknij emulator terminala. Proces w tmux działa
+   dalej. Jeśli proces agenta lub serwer tmux zakończy się, stan ekranu znika.
+   Zapisane pliki projektu pozostają na hoście.
+
+## Praca z telefonu
+
+| Komenda | Działanie |
+|---|---|
+| `/new mapy codex` | Tworzy nowy terminal w katalogu projektu. Istniejące sesje zostają otwarte. |
+| `/sessions` | Zwraca nazwy działających terminali tej instancji. |
+| `/open mapy` | Wraca do działającej sesji i pokazuje ostatnie linie ekranu. |
+| `/attach` | Pokazuje ostatnie linie wybranego panelu i włącza dalsze przekazywanie zmian. |
+| `/detach` | Odpina widok Matrix. `/stop` ma takie samo, niedestrukcyjne działanie. |
+| `/key Escape`, `/key C-c` | Wysyła klawisz do agenta. Dostępne klawisze pokazuje `/help`. |
+| `/agent codex` | Wybiera domyślną sesję tego agenta. |
+
+Tekst z Matrixa jest wklejany do przypiętego panelu i zatwierdzany klawiszem
+Enter. Bramkę można odłączyć, a po ponownym podłączeniu albo następnym wejściu
+przez Matrix praca odbywa się w tej samej sesji. Bramce nadal znana jest ostatnia
+wybrana sesja po restarcie. Nie wpisuje ponownie wiadomości z początkowego
+snapshotu pokoju.
+
+Z Matrixa widać tekstowe zmiany ekranu, także po wejściu lokalnym. Jest to
+próbkowany widok terminala, więc interfejsy pełnoekranowe ani pojedyncze
+odświeżenia między próbkami nie są odtwarzane piksel w piksel. Agent może pracować
+dowolnie długo. Bramkę można odłączyć lub wysłać klawisz bez czekania na odpowiedź
+modelu. Połączenia HTTP z Matrixem mają własne limity transportowe.
+
+## Obrazy i wiadomości głosowe
+
+- Obrazy PNG, JPEG, GIF i WebP z Matrixa trafiają do `UPLOADS_DIR/images-in`.
+  Terminal otrzymuje lokalną ścieżkę i opis załącznika.
+- Agent może odesłać np. render Blendera, mapę z QGIS lub zrzut ekranu.
+  Zapisuje gotową kopię pod unikalną nazwą w `UPLOADS_DIR/images-out`.
+  Widoczne pliki są wychwytywane od razu, dlatego zapisuj pod tymczasową nazwą
+  z kropką na początku i zmień ją po zakończeniu zapisu. Po potwierdzeniu
+  wysyłki mostek usuwa kopię z outboxa. `/status` pokazuje pełną ścieżkę.
+- Opcjonalne `VOICE_INPUT_MODE=transcribe` wysyła odszyfrowane nagranie do
+  Mistral STT po HTTPS, poza ochroną E2EE Matrixa. Ustaw `MISTRAL_API_KEY`
+  w konfiguracji bramki, jeśli chcesz korzystać z tego trybu.
+- Domyślne `VOICE_INPUT_MODE=files` przekazuje terminalowi plik z `VOICE_DIR/in`.
+  Program obsługujący audio może opublikować odpowiedź z tą samą nazwą bazową
+  w `VOICE_DIR/out`, z rozszerzeniem `.opus`, `.ogg`, `.wav` lub `.mp3`.
+  Gotowy plik należy opublikować przez zmianę nazwy. Bramce odpowiada dokładnie
+  jeden plik na żądanie. Po udanej wysyłce kopia jest usuwana. Ten tryb czeka
+  w tle bez przełączania się na STT.
+- Połączenia głosowe na żywo, w których telefon dzwoni do bramki, nie są jeszcze
+  obsługiwane. Starszy prototyp w `../vibe-matrix/voice_call.py` otwiera osobny
+  proces i nie współużytkuje żywej sesji terminala.
+
+## Uruchomienie E2EE
+
+1. Załóż dedykowane konto bota. Utwórz jego tożsamość cross-signing i klucz
+   odzyskiwania w zweryfikowanym kliencie Matrix. Zaloguj mostek jako osobne
+   urządzenie. Użyj tokena przypisanego do tego urządzenia i podaj jego
+   identyfikator jako `MATRIX_BOT_DEVICE_ID`. Mostek sprawdza oba dane przez
+   `/whoami`, a połączenie z homeserverem wymaga HTTPS.
+2. Skopiuj [.env.example](.env.example) do prywatnego pliku konfiguracyjnego.
+   Zapisz token w `MATRIX_ACCESS_TOKEN_FILE`. Wygeneruj osobne, losowe hasło i
+   zapisz je w `MATRIX_STORE_PASSPHRASE_FILE`. Pliki sekretów wymagają trybu
+   `0600`. Ustaw `MATRIX_STORE_DIR` na katalog stanu o trybie `0700`, osobny
+   dla każdego urządzenia i instancji. Katalog zawiera klucze urządzenia oraz
+   stan SDK w SQLite chroniony hasłem. Zachowaj katalog i hasło przy restartach.
+3. Zatrzymaj usługę mostka na czas konfiguracji i uruchom z tą samą konfiguracją:
+   `bridge-headless recover-device /prywatna/sciezka/do/klucza-odzyskiwania`.
+   Plik klucza odzyskiwania wymaga trybu `0600`. Przechowuj kopię poza hostem
+   i usuń kopię tymczasową, gdy weryfikacja urządzenia się powiedzie.
+4. Porównaj publiczny klucz główny cross-signing operatora z wartością z jego
+   zaufanego klienta, poza mostkiem. Zatwierdź operatora poleceniem
+   `bridge-headless verify-user @operator:example.org <publiczny-klucz-base64>`.
+   Operator również powinien zweryfikować konto mostka w swoim kliencie.
+   Dopiero wtedy uruchom usługę i użyj `/attach` z urządzenia operatora.
+
+Mostek przetwarza tylko zaszyfrowane zdarzenia z urządzeń zweryfikowanych przez
+cross-signing. Klucze pokoju wysyła do zaufanych urządzeń. Wyłączone jest
+przekazywanie historii E2EE przy zaproszeniach. Załączniki są szyfrowane przed
+wysłaniem, a pobrane załączniki sprawdzane kryptograficznie przed zapisaniem.
+W pokoju bez E2EE i przy błędzie weryfikacji mostek wstrzymuje działanie.
+Reakcje zostały wyłączone, ponieważ ujawniałyby metadane poza szyfrowaniem.
+
+E2EE kończy się na komputerze mostka. Terminal i pliki są tam odszyfrowane.
+Katalogi `UPLOADS_DIR`, `VOICE_DIR` i ich podkatalogi używane przez mostek
+muszą mieć tryb `0700`. Używaj wyłącznie konta hosta i natywnych narzędzi,
+którym powierzysz zawartość projektu. Szyfrowanie Matrixa nie chroni przed
+procesem działającym jako ten sam użytkownik systemu.
+
+## Konfiguracja i migracja
+
+- Zapisz dopuszczone **MXID** w `MATRIX_ALLOWED_USERS` jako listę oddzieloną
+  przecinkami. Pusta lista przerywa start. Wspólny dostęp można jawnie
+  włączyć przez `MATRIX_ALLOW_ALL_ROOM_MEMBERS=1` przy pustej liście.
+  Bramka sprawdza listę obecnych członków przed publikacją tekstu, obrazu
+  lub audio. Publikacja jest wstrzymywana, gdy do pokoju dołączy obca osoba
+  lub serwer nie zwróci listy członków. Dostęp do historii już zapisanej w Matrix
+  zależy od konfiguracji pokoju, więc ogranicz również widoczność historii.
+- Domyślny prefiks sesji to `vibe-matrix-rs`. `TMUX_SESSION` może wskazywać
+  wcześniej utworzoną sesję domyślną w tym samym serwerze. `/new` tworzy
+  oddzielne sesje pod prefiksem. Natywne CLI można wskazać przez `VIBE_CMD`,
+  `CODEX_CMD`, `CLAUDE_CMD` i `AGY_CMD`.
+- W konfiguracjach ze starej wersji `AGENT_MODE`, `VIBE_TIMEOUT_SECS` i
+  `SESSION_FILE` nie sterują już pracą terminala. Sesje zachowuje tmux,
+  a bramka zapisuje nazwę wybranego terminala w `ACTIVE_TERMINAL_FILE`.
+  Na PC ustaw ten plik w katalogu stanu użytkownika zgodnie z przykładem.
+- Przy aktualizacji istniejącej instalacji sprawdź `TMUX_TMPDIR` przed
+  restartem. Użyj starego socketu, jeżeli chcesz zachować działające sesje.
+  Przy uruchamianiu poza instalatorem możesz wystartować serwer tmux poza
+  procesem bramki poleceniem `tmux -D`, pod tym samym kontem i z tym samym
+  `TMUX_TMPDIR`. Usługa systemowa pod dedykowanym kontem ma dostęp tylko
+  do plików i narzędzi dostępnych dla tego konta.
+- Bramce wystarczy wychodzące połączenie HTTPS z homeserverem. Nie udostępniaj
+  socketu tmux przez sieć. Lokalna bramka nie przekazuje tokena Matrix do
+  nowo uruchamianego tmuxa.
+
+```bash
+cargo build --locked --release --workspace
+cargo test --locked --workspace
+# Opcjonalny test E2EE na jednorazowym lokalnym Synapse z włączoną rejestracją:
+MATRIX_TEST_URL=http://127.0.0.1:8008 \
+  cargo test --locked --workspace --test synapse_e2ee -- --ignored
 ```
-MATRIX_HOMESERVER=https://matrix.owl-post.eu   # https:// wymagane (ALLOW_INSECURE_HTTP=1 tylko lokalnie)
-MATRIX_ACCESS_TOKEN=...
-MATRIX_ROOM_ID=!....:matrix.owl-post.eu
-MATRIX_BOT_USER_ID=@vibe-rs:matrix.owl-post.eu
-MATRIX_ALLOWED_USERS=@stanislaw:matrix.owl-post.eu
-INBOUND_MAX_PER_MIN=6      # rate limit inbound per nadawca (sliding window 60s)
-MAX_SEEN_EVENTS=100000     # cap zbioru dedup
-VIBE_TIMEOUT_SECS=600
-SYNC_TIMEOUT_MS=30000
-STATE_FILE=/var/lib/vibe-matrix-rs/seen.txt
-SESSION_FILE=/var/lib/vibe-matrix-rs/session.txt
-AGENT_FILE=/var/lib/vibe-matrix-rs/agent.txt
-TMUX_PREFIX=vibe-matrix-rs
-VIBE_WORKDIR=/var/lib/vibe-matrix-rs/vibe-work
-AGENT_HOME=/var/lib/vibe-matrix-rs/agent-home
-VIBE_ENV_KEYS=MISTRAL_API_KEY
-# AGY_CMD=agy               # ścieżka do binarki agy (default: z PATH)
-# AGENT_PATH=...            # opcjonalny PATH dla subprocessu agenta
-```
-
-## Build & run (na VPS, jako dedykowany user — NIE root)
-```
-useradd -r -d /var/lib/vibe-matrix-rs -s /usr/sbin/nologin vibe-matrix-rs
-install -d -m 0750 -o vibe-matrix-rs -g vibe-matrix-rs /var/lib/vibe-matrix-rs
-# env file: root:vibe-matrix-rs, chmod 640; konfiguracje agentów (vibe/claude/...)
-# żyją w HOME=/var/lib/vibe-matrix-rs (ustawionym w unitcie)
-cd /opt/ai-bridges/bridges/vibe-matrix-rs
-cargo build --release
-systemctl enable --now vibe-matrix-rs
-journalctl -u vibe-matrix-rs -f
-```
-
-## Dalej (Faza 2+): tmux/TUI, media, redb dedup, landlock, governor rate-limit, metryki.
-
-## Kontynuacja sesji (kontekst między wiadomościami) — v2
-- każda wiadomość leci jako `vibe -p <msg> --yolo --output json [--resume <session_id>]`
-- `session_id` brane z JSON journal i zapisywane w `SESSION_FILE` (default `/var/lib/vibe-matrix-rs/session.txt`)
-- dzięki `--resume` vibe **pamięta poprzednie wiadomości** (tak jak tmux w wersji Python)
-- workdir vibe: `VIBE_WORKDIR` (default `/var/lib/vibe-matrix-rs/vibe-work`)
-- dodatkowo: bezpieczny `safe_truncate` (UTF-8 char boundary — nie panikuje na emoji), testy jednostkowe
-
-## Komendy (v3)
-- `/new` — reset sesji vibe (usuwa `SESSION_FILE`, następna wiadomość = nowy kontekst)
-- `/model` / `/model <nazwa>` — pokaż/ustaw model (`--model`, zapis w `MODEL_FILE`)
-- `/think` / `/think <off|low|medium|high|xhigh|max>` — pokaż/ustaw thinking (`--thinking`, zapis w `THINK_FILE`; vibe stosuje przy nowej sesji → użyj `/new`)
-- `/status` — pokój, sesja, model, think, liczba seen, uptime
-- `/help` — lista komend
-- nieznane `/coś` → odpowiedź „nieznana komenda” (NIE leci do agenta)
-
-## /provider (v4)
-- `/provider` — pokaż aktualnego providera
-- `/provider <mistral|openai|anthropic|google>` — przełącza providera: do subprocessa vibe leci tylko odpowiedni klucz (`MISTRAL_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`), zapis w `PROVIDER_FILE`
-- brak klucza w env bota → komunikat ⚠️ (dodaj do `/etc/vibe-matrix-rs.env`, chmod 600) i błąd przy runie
-- bez `/provider` = backward-compat: wszystkie klucze z `VIBE_ENV_KEYS`
-
-## v5 — terminalowe "tuxy" (bez kluczy API, bez --resume)
-Architektura: agent (vibe/codex/claude/agy) żyje w stałej sesji **tmux**, bridge robi tylko `send-keys` + `capture-pane`.
-- sesja tmux: `<TMUX_PREFIX>-<agent>` (default `vibe-matrix-rs-vibe`), workdir `VIBE_WORKDIR`
-- odpowiedź wykrywana przez poll `capture-pane` co 2s (koniec = 3 próbki bez zmian, max `VIBE_TIMEOUT_SECS`)
-- komendy bridge'a: `/new [agent]`, `/agent <vibe|codex|claude|agy>`, `/attach` (capture ekranu), `/stop`, `/status`, `/help`
-- wszystkie inne wiadomości (także `/model`, `/think` TUI agenta) lecą prosto do tmuxa — kontekst pamięta agent
-- env: `AGENT_FILE`, `TMUX_PREFIX`, `VIBE_WORKDIR`, `AGY_CMD` (ścieżka do binarki agy), `AGENT_PATH`, `INBOUND_MAX_PER_MIN` (rate limit inbound), `MAX_SEEN_EVENTS` (reszta jak wcześniej)
-- hardening: inbound rate limit per nadawca (sliding 60s, dla tekstu i `m.audio`), wymuszenie `https://` dla homeservera, token jako `SecretString`, zbiór `seen` z capem `MAX_SEEN_EVENTS` i zapisem tylko przy zmianie, walidacja agenta z `AGENT_FILE`
-- uwaga: `agy` wymaga OAuth login na hoście (interaktywnie, w jego `$HOME`), inaczej sesja tmux od razu pada
-
-## v6 — voice (m.audio ↔ STT/TTS przez Mistral API)
-- wiadomość głosowa (`m.audio`) → download mxc → **STT** (`/v1/audio/transcriptions`, model `voxtral-mini-latest`, auto-language) → tekst → agent w tmux (`[voice message od ...]: ...`) → odpowiedź
-- `/voice on|off` — gdy ON, wszystkie odpowiedzi (też na tekst) idą jako **voice message** (TTS `voxtral-mini-tts-latest` → opus → upload → `m.audio` + `org.matrix.msc3245.voice` + waveform)
-- wymaga `MISTRAL_API_KEY` w env bota (`/etc/vibe-matrix-rs.env`)
-- E2EE media (`content.file`) → komunikat "nieobsługiwane" (MVP)
-- uwaga: modele transcribe nie znają `language=pl` — auto-detect; TTS odpowiada JSON `{"audio_data": base64}`
-- dzwonienie `m.call` (MSC3245/WebRTC) = Faza 6 (wymaga SFU) — na razie tylko voice messages
-- env: `VOICE_FILE`, `UPLOADS_DIR`, `STT_MODEL`, `TTS_MODEL`, `TTS_VOICE`
-
-## v7 — wątki + instalacja na PC (tryb "w aucie")
-- odpowiedzi bota (tekst i voice) lecą jako **wątek** (`m.thread`) do wiadomości użytkownika
-- `/voice new` — reset konwersacji głosowej (czyści sesję tmux)
-- `pc-install/` — instalacja na PC (Linux, user systemd): `./pc-install/install.sh`
-  - klonuje repo do ~/ai-bridges, buduje, konfiguruje `~/.config/vibe-matrix-rs/env`, enable'uje `systemd --user`
-  - potem w pokoju: `/voice on` → seria voice messages = ciągła konwersacja z kontekstem (tmux)
-- prawdziwy call `m.call` (WebRTC/MSC3245, answer bota) = Faza 6 (osobny klient WebRTC, np. aiortc w Pythonowym bridge)
-
-## v8 — voice jako KONNEKTOR (passthrough do terminala)
-Bridge tylko przekazuje audio między Matrix a terminalem agenta ( który ma własny tryb voice):
-- `m.audio` od użytkownika → plik w `VOICE_DIR/in/<stem>.wav`
-- agent w tmux (tryb voice) odpowiada plikiem w `VOICE_DIR/out/<stem>.opus` → watcher (1s) → upload → `m.audio` na Matrix
-- fallback: jeśli w `VOICE_FALLBACK_SECS` (default 15s) terminal nie odpowie → lokalny STT→agent→TTS (v6 API)
-- `/voice on|off|new` jak wcześniej; env: `VOICE_DIR`
-- uwaga: prawdziwy m.call (WebRTC) NIE jest potrzebny — rozmowa głosowa idzie przez voice messages + terminal
-
-## Podpinanie otwartych okien terminali do Matrix (v10+)
-- Agent w sesji tmux = automatycznie podpięty do pokoju: `tmux attach -t <TMUX_PREFIX>-<agent>`
-  pokazuje to samo okno, które czyta mostek (send-keys/capture-pane).
-- **TMUX_TMPDIR pod $HOME** jest wymagany (unit ma PrivateTmp) — w shellu:
-  `export TMUX_TMPDIR=$HOME/.local/state/vibe-matrix-rs/tmux`
-- Własna nazwa sesji zamiast `<prefix>-<agent>`: `TMUX_SESSION=<nazwa>` w env instancji.
-- Istniejące okno konsole: `tools/attach-window.py <PID> <sesja> --force` (reptyr -T) —
-  działa gdy ptrace jest dozwolone (ptrace_scope=0 i SELinux permissive); na Fedora Enforcing
-  dla okien konsole pomoże tylko sudo. Zalecane: odpalaj okna agentów od razu w tmux
-  (`tmux new -s aw-astra` w karcie konsole) — wtedy mostek i Twoje okno to jedna sesja.
-- Odpowiedzi z ekranu TUI są czyszczone (`clean_tui`): bez ramek ───, pasków `usage ██ 44%`,
-  spinnerów i promptów — na Matrix leci sam tekst odpowiedzi.
-
-## v10 — AGENT_MODE=tmux dla wszystkich agentów (okno podpięte do Matrix, attach)
-- `AGENT_MODE=tmux` wymusza tryb tmux dla dowolnego agenta (vibe/codex/claude/agy); default bez zmiennej: agy=tmux, reszta=subprocess `--resume`
-- sesja tmux: `<TMUX_PREFIX>-<agent>` (np. `vibe-matrix-rs-vibe`) — `tmux attach -t vibe-matrix-rs-vibe` podpina Twoje okno do pokoju Matrix; wiadomości z Matrixa lecą jako send-keys, odpowiedzi jako capture-pane
-- **TMUX_TMPDIR pod $HOME** (np. `~/.local/state/vibe-matrix-rs/tmux`) — unit user ma `PrivateTmp=true`, więc bez tego socket tmux byłby w prywatnym /tmp i `tmux attach` z konsole by nie widział sesji; w shellu: `export TMUX_TMPDIR=$HOME/.local/state/vibe-matrix-rs/tmux`
-
-## v9 — dispatch per agent + fixy E2E (Faza 6 test)
-- vibe/codex/claude: subprocess `AGENT -p --resume <sid> --yolo --output json` (szybko, bez menu TUI; sesja per agent w `<SESSION_FILE>.<agent>`)
-- agy: tmux TUI (send-keys/capture-pane) — tam działa tryb voice
-- fix: media download v1 first (ten Synapse nie ma v3 download), HOME agenta = AGENT_HOME (nie /root)
-- fix: m.audio NIE może mieć m.relates_to (Synapse 400) — voice odpowiedzi poza wątkiem, tekst w wątku
-- E2E test OK: m.audio -> voice/in -> fallback 15s -> STT -> vibe -> TTS -> m.audio (MSC3245 voice) w pokoju

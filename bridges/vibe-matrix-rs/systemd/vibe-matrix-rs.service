@@ -3,6 +3,7 @@ Description=vibe-matrix-rs (Rust bridge: Matrix room <-> terminal agent w tmux)
 After=network.target matrix-synapse.service
 
 [Service]
+UMask=0077
 Type=simple
 # Dedykowany user, NIE root. Jednorazowy setup:
 #   useradd -r -d /var/lib/vibe-matrix-rs -s /usr/sbin/nologin vibe-matrix-rs

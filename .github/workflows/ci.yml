@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   rust-vibe-matrix-rs:
     name: Rust bridge (bridges/vibe-matrix-rs)
@@ -14,13 +17,26 @@ jobs:
         working-directory: bridges/vibe-matrix-rs
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Lint bridge code
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Run Rust unit tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
+      - name: Install disposable Matrix homeserver
+        run: |
+          python -m venv "$RUNNER_TEMP/bridge-synapse"
+          "$RUNNER_TEMP/bridge-synapse/bin/python" -m pip install matrix-synapse==1.165.0
+      - name: Verify E2EE on Synapse
+        run: bash tools/test-synapse-e2ee.sh "$RUNNER_TEMP/bridge-synapse/bin/python"
 
   rust-octomesh-cli:
     name: Rust octomesh-cli (tools/octomesh-cli)
@@ -30,6 +46,8 @@ jobs:
         working-directory: tools/octomesh-cli
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -48,6 +66,8 @@ jobs:
         working-directory: tools/octomesh-cli/adapters
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v3
         with:
           python-version: "3.11"

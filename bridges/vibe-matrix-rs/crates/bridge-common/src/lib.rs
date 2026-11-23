@@ -2,8 +2,10 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use secrecy::SecretString;
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashSet, VecDeque};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -11,26 +13,78 @@ pub struct Config {
     pub token: SecretString,
     pub room_id: String,
     pub bot_user_id: String,
-    pub allowed_users: Vec<String>,
+    pub matrix_device_id: String,
+    pub matrix_store_dir: PathBuf,
+    pub matrix_store_passphrase_file: PathBuf,
+    pub allow_insecure_loopback: bool,
+    access: MatrixAccess,
     pub vibe_cmd: String,
-    pub vibe_timeout_secs: u64,
     pub sync_timeout_ms: u32,
     pub inbound_max_per_min: u32,
     pub max_seen_events: usize,
+    pub max_pending_media: usize,
     pub state_file: String,
-    pub session_file: String,
     pub agent_file: String,
+    pub active_terminal_file: String,
     pub tmux_prefix: String,
     pub vibe_workdir: String,
-    pub voice_file: String,
     pub uploads_dir: String,
     pub voice_dir: String,
-    pub voice_fallback_secs: u64,
-    pub agent_home: String,
     pub stt_model: String,
-    pub tts_model: String,
-    pub tts_voice: String,
-    pub vibe_env_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+enum MatrixAccess {
+    Only(HashSet<String>),
+    WholeRoom,
+}
+
+impl MatrixAccess {
+    fn parse(allowed: &str, whole_room: &str) -> Result<Self> {
+        let users: HashSet<_> = allowed
+            .split(',')
+            .map(str::trim)
+            .filter(|user| !user.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let whole_room = match whole_room.trim() {
+            "" | "0" => false,
+            "1" => true,
+            _ => anyhow::bail!("MATRIX_ALLOW_ALL_ROOM_MEMBERS musi mieć wartość 0 lub 1"),
+        };
+        match (users.is_empty(), whole_room) {
+            (true, true) => Ok(Self::WholeRoom),
+            (false, false) => {
+                anyhow::ensure!(
+                    users.iter().all(|user| {
+                        user.strip_prefix('@')
+                            .and_then(|id| id.split_once(':'))
+                            .is_some_and(|(local, server)| {
+                                !local.is_empty()
+                                    && !server.is_empty()
+                                    && !user.chars().any(char::is_whitespace)
+                            })
+                    }),
+                    "MATRIX_ALLOWED_USERS musi zawierać identyfikatory @użytkownik:serwer"
+                );
+                Ok(Self::Only(users))
+            }
+            (false, true) => anyhow::bail!(
+                "Ustaw tylko MATRIX_ALLOWED_USERS albo MATRIX_ALLOW_ALL_ROOM_MEMBERS=1"
+            ),
+            (true, false) => anyhow::bail!(
+                "Ustaw MATRIX_ALLOWED_USERS albo jawnie MATRIX_ALLOW_ALL_ROOM_MEMBERS=1"
+            ),
+        }
+    }
+
+    fn permits(&self, bot: &str, sender: &str) -> bool {
+        sender != bot
+            && match self {
+                Self::Only(users) => users.contains(sender),
+                Self::WholeRoom => true,
+            }
+    }
 }
 
 impl Config {
@@ -38,35 +92,35 @@ impl Config {
         let get = |k: &str| -> Result<String> {
             std::env::var(k).with_context(|| format!("brak zmiennej env {k}"))
         };
-        let allowed = std::env::var("MATRIX_ALLOWED_USERS").unwrap_or_default();
-        let vibe_env_keys =
-            std::env::var("VIBE_ENV_KEYS").unwrap_or_else(|_| "MISTRAL_API_KEY".to_string());
-        let homeserver = std::env::var("MATRIX_HOMESERVER")
-            .unwrap_or_else(|_| "https://matrix.owl-post.eu".to_string());
-        let allow_insecure = std::env::var("ALLOW_INSECURE_HTTP")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if !allow_insecure && !homeserver.starts_with("https://") {
-            anyhow::bail!(
-                "MATRIX_HOMESERVER musi być https:// (token leci Bearerem); \
-                 ustaw ALLOW_INSECURE_HTTP=1 tylko świadomie, lokalnie"
+        let optional = |name| match std::env::var(name) {
+            Ok(value) => Ok(value),
+            Err(std::env::VarError::NotPresent) => Ok(String::new()),
+            Err(error) => Err(error).with_context(|| format!("nie można odczytać {name}")),
+        };
+        let allowed = optional("MATRIX_ALLOWED_USERS")?;
+        let whole_room = optional("MATRIX_ALLOW_ALL_ROOM_MEMBERS")?;
+        let access = MatrixAccess::parse(&allowed, &whole_room)?;
+        let token_file = optional("MATRIX_ACCESS_TOKEN_FILE")?;
+        let token = if token_file.is_empty() {
+            SecretString::new(get("MATRIX_ACCESS_TOKEN")?.into())
+        } else {
+            anyhow::ensure!(
+                optional("MATRIX_ACCESS_TOKEN")?.is_empty(),
+                "ustaw tylko jedno źródło tokena Matrix"
             );
-        }
+            read_private_secret(Path::new(&token_file)).context("odczyt tokena Matrix")?
+        };
         Ok(Self {
-            homeserver,
-            token: SecretString::new(get("MATRIX_ACCESS_TOKEN")?.into()),
+            homeserver: get("MATRIX_HOMESERVER")?,
+            token,
             room_id: get("MATRIX_ROOM_ID")?,
             bot_user_id: get("MATRIX_BOT_USER_ID")?,
-            allowed_users: allowed
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
+            matrix_device_id: get("MATRIX_BOT_DEVICE_ID")?,
+            matrix_store_dir: PathBuf::from(get("MATRIX_STORE_DIR")?),
+            matrix_store_passphrase_file: PathBuf::from(get("MATRIX_STORE_PASSPHRASE_FILE")?),
+            allow_insecure_loopback: optional("ALLOW_INSECURE_HTTP")? == "1",
+            access,
             vibe_cmd: std::env::var("VIBE_CMD").unwrap_or_else(|_| "vibe".to_string()),
-            vibe_timeout_secs: std::env::var("VIBE_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(600),
             sync_timeout_ms: std::env::var("SYNC_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -79,40 +133,73 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100_000),
+            max_pending_media: std::env::var("MAX_PENDING_MEDIA")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v| (1..=64).contains(v))
+                .unwrap_or(8),
             state_file: std::env::var("STATE_FILE")
                 .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/seen.txt".to_string()),
-            session_file: std::env::var("SESSION_FILE")
-                .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/session.txt".to_string()),
             agent_file: std::env::var("AGENT_FILE")
                 .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/agent.txt".to_string()),
+            active_terminal_file: std::env::var("ACTIVE_TERMINAL_FILE")
+                .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/active-terminal.txt".to_owned()),
             tmux_prefix: std::env::var("TMUX_PREFIX")
                 .unwrap_or_else(|_| "vibe-matrix-rs".to_string()),
-            voice_file: std::env::var("VOICE_FILE")
-                .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/voice.txt".to_string()),
             uploads_dir: std::env::var("UPLOADS_DIR")
                 .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/uploads".to_string()),
             voice_dir: std::env::var("VOICE_DIR")
                 .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/voice".to_string()),
-            voice_fallback_secs: std::env::var("VOICE_FALLBACK_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(15),
-            agent_home: std::env::var("AGENT_HOME")
-                .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/agent-home".to_string()),
             stt_model: std::env::var("STT_MODEL")
                 .unwrap_or_else(|_| "voxtral-mini-latest".to_string()),
-            tts_model: std::env::var("TTS_MODEL")
-                .unwrap_or_else(|_| "voxtral-mini-tts-latest".to_string()),
-            tts_voice: std::env::var("TTS_VOICE").unwrap_or_else(|_| "gb_jane_neutral".to_string()),
             vibe_workdir: std::env::var("VIBE_WORKDIR")
                 .unwrap_or_else(|_| "/var/lib/vibe-matrix-rs/vibe-work".to_string()),
-            vibe_env_keys: vibe_env_keys
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
         })
     }
+
+    pub fn accepts_sender(&self, sender: &str) -> bool {
+        self.access.permits(&self.bot_user_id, sender)
+    }
+
+    pub fn room_audience(&self) -> Option<HashSet<String>> {
+        match &self.access {
+            MatrixAccess::Only(users) => {
+                let mut audience = users.clone();
+                audience.insert(self.bot_user_id.clone());
+                Some(audience)
+            }
+            MatrixAccess::WholeRoom => None,
+        }
+    }
+}
+
+/// Use an existing private directory or create it without a public mode window.
+pub fn private_directory(path: &Path) -> Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.permissions().mode() & 0o077 == 0,
+        "wymagany prywatny katalog bez symlinka (chmod 700): {}",
+        path.display()
+    );
+    Ok(())
+}
+
+pub fn read_private_secret(path: &Path) -> Result<SecretString> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
+        "wymagany prywatny plik bez symlinka (chmod 600)"
+    );
+    anyhow::ensure!(metadata.len() <= 4096, "plik sekretu jest za duży");
+    let content = SecretString::from(std::fs::read_to_string(path)?);
+    use secrecy::ExposeSecret;
+    let value = content.expose_secret().trim();
+    anyhow::ensure!(!value.is_empty(), "pusty plik sekretu");
+    Ok(SecretString::new(value.into()))
 }
 
 pub fn init_logging() {
@@ -121,28 +208,75 @@ pub fn init_logging() {
         .init();
 }
 
-/// Wczytuje zbiór już przetworzonych event_id.
-pub fn load_seen(path: &str) -> HashSet<String> {
-    let mut set = HashSet::new();
-    if let Ok(content) = std::fs::read_to_string(path) {
-        for line in content.lines() {
-            let l = line.trim();
-            if !l.is_empty() {
-                set.insert(l.to_string());
-            }
-        }
-    }
-    set
+/// A bounded FIFO of event IDs keeps recent commands deduplicated across restarts.
+pub struct SeenEvents {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+    limit: usize,
 }
 
-pub fn save_seen(path: &str, seen: &HashSet<String>) -> Result<()> {
-    if let Some(dir) = Path::new(path).parent() {
-        std::fs::create_dir_all(dir)?;
+impl SeenEvents {
+    pub fn load(path: &str, limit: usize) -> Result<Self> {
+        let mut events = Self {
+            ids: HashSet::new(),
+            order: VecDeque::new(),
+            limit: limit.max(1),
+        };
+        match std::fs::File::open(path) {
+            Ok(file) => {
+                for line in BufReader::new(file).lines() {
+                    let line = line?;
+                    let id = line.trim();
+                    if !id.is_empty() {
+                        events.insert(id);
+                    }
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("odczyt historii zdarzeń Matrix"),
+        }
+        Ok(events)
     }
-    let mut v: Vec<&String> = seen.iter().collect();
-    v.sort();
-    std::fs::write(path, v.iter().map(|s| format!("{s}\n")).collect::<String>())
-        .context("zapis state_file")
+
+    pub fn insert(&mut self, id: &str) -> bool {
+        if !self.ids.insert(id.to_owned()) {
+            return false;
+        }
+        self.order.push_back(id.to_owned());
+        if self.order.len() > self.limit {
+            if let Some(oldest) = self.order.pop_front() {
+                self.ids.remove(&oldest);
+            }
+        }
+        true
+    }
+
+    pub fn save(&self, path: &str) -> Result<()> {
+        let path = Path::new(path);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let temporary = path.with_extension(format!("tmp-{}-{now:x}", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        let result = (|| {
+            for id in &self.order {
+                writeln!(file, "{id}")?;
+            }
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result.context("zapis historii zdarzeń Matrix")
+    }
 }
 
 /// Session id vibe (do `--resume`), trzymany w osobnym pliku.
@@ -193,6 +327,66 @@ pub fn safe_truncate(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_cache_evicts_only_the_oldest_id_and_survives_reload() {
+        let root = std::env::temp_dir().join(format!("matrix-seen-test-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let path = root.join("seen.txt");
+        let path = path.to_str().unwrap();
+        let mut seen = SeenEvents::load(path, 2).unwrap();
+        for id in ["old", "previous", "new"] {
+            assert!(seen.insert(id));
+        }
+        assert!(!seen.insert("previous"));
+        seen.save(path).unwrap();
+        let mut loaded = SeenEvents::load(path, 2).unwrap();
+        assert!(!loaded.insert("new"));
+        assert!(loaded.insert("old"));
+        assert!(loaded.insert("previous"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn secrets_and_crypto_directories_require_private_permissions() {
+        let root = std::env::temp_dir().join(format!("matrix-private-test-{}", std::process::id()));
+        private_directory(&root).unwrap();
+        let secret = root.join("secret");
+        std::fs::write(&secret, "synthetic test value\n").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_private_secret(&secret).is_err());
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_private_secret(&secret).is_ok());
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        assert!(read_private_secret(&link).is_err());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_directory(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn matrix_access_is_explicit_and_always_excludes_the_bot() {
+        let bot = "@bot:example.org";
+        let allowed = "@alice:example.org";
+        let other = "@bob:example.org";
+        for config in [
+            ("", ""),
+            (" , ", "0"),
+            ("alice", "0"),
+            (allowed, "1"),
+            ("", "yes"),
+        ] {
+            assert!(MatrixAccess::parse(config.0, config.1).is_err());
+        }
+        let only = MatrixAccess::parse(&format!(" {allowed}, {bot} "), "0").unwrap();
+        assert!(only.permits(bot, allowed));
+        assert!(!only.permits(bot, other));
+        assert!(!only.permits(bot, bot));
+        let room = MatrixAccess::parse("", "1").unwrap();
+        assert!(room.permits(bot, other));
+        assert!(!room.permits(bot, bot));
+    }
 
     #[test]
     fn truncate_utf8_safe() {
@@ -289,8 +483,16 @@ pub fn clean_tui(input: &str) -> String {
             continue; // zwinięty Thought
         }
         // status bar / separator z opisem: linia z box-drawing + słowa statusu (model, usage, %, tryb)
-        let boxchars = t.chars().filter(|c| ('\u{2500}'..='\u{259F}').contains(c)).count();
-        if boxchars >= 4 && (re_status.is_match(t) || t.contains('%') || t.contains("usage") || t.contains("ctx")) {
+        let boxchars = t
+            .chars()
+            .filter(|c| ('\u{2500}'..='\u{259F}').contains(c))
+            .count();
+        if boxchars >= 4
+            && (re_status.is_match(t)
+                || t.contains('%')
+                || t.contains("usage")
+                || t.contains("ctx"))
+        {
             continue;
         }
         // pasek użycia typu `usage ██▋ 44% · PAYG · ctx ▁ 2%` (bloki + %)

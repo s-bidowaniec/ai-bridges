@@ -1,1 +1,7 @@
 target/
+
+# Lokalny stan szyfrowania i pliki z sekretami testowych instalacji
+/e2ee/
+/matrix-token
+/matrix-store-passphrase
+/matrix-recovery-key

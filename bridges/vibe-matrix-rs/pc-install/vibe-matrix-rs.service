@@ -1,10 +1,13 @@
 [Unit]
 Description=vibe-matrix-rs bridge (Matrix room <-> tmux agent, voice)
-After=network-online.target
+Wants=vibe-matrix-terminal.service
+After=network-online.target vibe-matrix-terminal.service
 
 [Service]
+UMask=0077
 Type=simple
 EnvironmentFile=%h/.config/vibe-matrix-rs/env
+Environment=TMUX_TMPDIR=%h/.local/share/vibe-matrix-rs/tmux
 WorkingDirectory=%h/ai-bridges/bridges/vibe-matrix-rs
 ExecStart=%h/ai-bridges/bridges/vibe-matrix-rs/target/release/bridge-headless
 Restart=always

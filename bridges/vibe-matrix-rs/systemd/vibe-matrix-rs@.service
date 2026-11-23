@@ -7,6 +7,7 @@ Description=vibe-matrix-rs (Rust bridge Matrix <-> agent, instancja %i)
 After=network.target
 
 [Service]
+UMask=0077
 Type=simple
 User=vibe-matrix-rs
 Group=vibe-matrix-rs

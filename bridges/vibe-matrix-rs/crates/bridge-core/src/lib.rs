@@ -1,51 +1,52 @@
-//! bridge-core: minimalny klient Matrix (sync/send/reakcje) przez reqwest + Bearer.
-use anyhow::{Context, Result};
-use secrecy::{ExposeSecret, SecretString};
+//! Matrix E2EE over the SDK, with verified-device and room membership checks.
+use anyhow::{bail, ensure, Context, Result};
+use bridge_common::{private_directory, read_private_secret, Config};
+use matrix_sdk::{
+    attachment::{AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseImageInfo},
+    authentication::matrix::MatrixSession,
+    config::{SyncSettings, SyncToken},
+    deserialized_responses::{TimelineEvent, VerificationState},
+    reqwest::{redirect::Policy, Url},
+    ruma::{
+        api::client::{
+            filter::FilterDefinition, membership::joined_members, sync::sync_events::v3::Filter,
+        },
+        events::{room::message::RoomMessageEventContent, room::EncryptedFile},
+        OwnedRoomId, RoomId, UserId,
+    },
+    Client, Room, RoomState, SessionMeta, SessionTokens,
+};
+use matrix_sdk_crypto::{
+    AttachmentDecryptor, CollectStrategy, DecryptionSettings, TrustRequirement,
+};
+use secrecy::ExposeSecret;
 use serde::Deserialize;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    fs::{File, OpenOptions},
+    io::{Cursor, Read},
+    os::unix::fs::OpenOptionsExt,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
-fn now_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MatrixClient {
-    http: reqwest::Client,
-    base: String,
-    token: SecretString,
-    room_id: String,
+    client: Client,
+    http: matrix_sdk::reqwest::Client,
+    homeserver: Url,
+    room_id: OwnedRoomId,
+    audience: Option<Arc<HashSet<String>>>,
+    _store_lock: Arc<File>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct SyncResponse {
-    #[serde(default)]
+pub struct SyncBatch {
     pub next_batch: String,
-    #[serde(default)]
-    pub rooms: Rooms,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct Rooms {
-    #[serde(default)]
-    pub join: std::collections::HashMap<String, JoinedRoom>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct JoinedRoom {
-    #[serde(default)]
-    pub timeline: Timeline,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct Timeline {
-    #[serde(default)]
     pub events: Vec<Event>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct Event {
     #[serde(rename = "event_id")]
     pub id: String,
@@ -56,283 +57,401 @@ pub struct Event {
     pub content: EventContent,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone, Default)]
 pub struct EventContent {
     #[serde(default)]
     pub body: String,
     #[serde(default)]
     pub msgtype: String,
     #[serde(default)]
-    pub url: Option<String>,
+    file: Option<EncryptedFile>,
     #[serde(default)]
-    pub file: Option<serde_json::Value>,
-    #[serde(default)]
-    pub info: Option<serde_json::Value>,
+    info: Option<serde_json::Value>,
+    #[serde(rename = "m.relates_to", default)]
+    pub relates_to: Option<serde_json::Value>,
 }
 
-fn enc(s: &str) -> String {
-    // percent-encode dla path (room id ma ! i :)
-    let mut out = String::new();
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
+fn authenticated_event(event: &TimelineEvent) -> Option<Event> {
+    let info = event.encryption_info()?;
+    if info.verification_state != VerificationState::Verified || info.forwarder.is_some() {
+        return None;
     }
-    out
+    let event: Event = serde_json::from_str(event.raw().json().get()).ok()?;
+    (event.sender == info.sender.as_str()).then_some(event)
+}
+
+fn homeserver_url(value: &str, allow_loopback: bool) -> Result<Url> {
+    let url = Url::parse(value).context("niepoprawny MATRIX_HOMESERVER")?;
+    let loopback = url
+        .host_str()
+        .is_some_and(|host| matches!(host, "127.0.0.1" | "[::1]"));
+    ensure!(
+        url.scheme() == "https" || (allow_loopback && url.scheme() == "http" && loopback),
+        "MATRIX_HOMESERVER wymaga HTTPS; HTTP jest dostępne tylko dla testów przez loopback"
+    );
+    ensure!(
+        url.host().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "MATRIX_HOMESERVER musi być adresem bez danych logowania, parametrów i fragmentu"
+    );
+    Ok(url)
 }
 
 impl MatrixClient {
-    pub fn new(base: &str, token: &SecretString, room_id: &str) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(90))
+    pub async fn new(config: &Config) -> Result<Self> {
+        let homeserver = homeserver_url(&config.homeserver, config.allow_insecure_loopback)?;
+        let room_id = RoomId::parse(&config.room_id).context("niepoprawny MATRIX_ROOM_ID")?;
+        let user_id =
+            UserId::parse(&config.bot_user_id).context("niepoprawny MATRIX_BOT_USER_ID")?;
+        ensure!(
+            !config.matrix_device_id.trim().is_empty(),
+            "MATRIX_BOT_DEVICE_ID jest pusty"
+        );
+        private_directory(&config.matrix_store_dir).context("katalog stanu E2EE")?;
+        let store_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .mode(0o600)
+            .open(config.matrix_store_dir.join("bridge.lock"))?;
+        store_lock
+            .try_lock()
+            .context("magazyn E2EE jest używany przez inną instancję")?;
+        let passphrase = read_private_secret(&config.matrix_store_passphrase_file)
+            .context("odczyt hasła magazynu E2EE")?;
+        let http = matrix_sdk::reqwest::Client::builder()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(90))
             .build()?;
+        let client = Client::builder()
+            .homeserver_url(homeserver.as_str())
+            .http_client(http.clone())
+            .sqlite_store(&config.matrix_store_dir, Some(passphrase.expose_secret()))
+            .with_enable_share_history_on_invite(false)
+            .with_room_key_recipient_strategy(CollectStrategy::OnlyTrustedDevices)
+            .with_decryption_settings(DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::CrossSigned,
+            })
+            .build()
+            .await
+            .context("inicjalizacja klienta E2EE")?;
+        client
+            .restore_session(MatrixSession {
+                meta: SessionMeta {
+                    user_id: user_id.clone(),
+                    device_id: config.matrix_device_id.as_str().into(),
+                },
+                tokens: SessionTokens {
+                    access_token: config.token.expose_secret().to_owned(),
+                    refresh_token: None,
+                },
+            })
+            .await?;
+        let identity = client
+            .whoami()
+            .await
+            .context("sprawdzenie konta i urządzenia Matrix")?;
+        ensure!(
+            identity.user_id == user_id
+                && identity
+                    .device_id
+                    .as_deref()
+                    .is_some_and(|device| device.as_str() == config.matrix_device_id),
+            "token Matrix nie należy do wskazanego konta i urządzenia"
+        );
         Ok(Self {
+            client,
             http,
-            base: base.trim_end_matches('/').to_string(),
-            token: token.clone(),
-            room_id: room_id.to_string(),
+            homeserver,
+            room_id,
+            audience: config.room_audience().map(Arc::new),
+            _store_lock: Arc::new(store_lock),
         })
     }
 
-    fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        req.bearer_auth(self.token.expose_secret())
+    pub async fn recover_device(&self, key_file: &Path) -> Result<()> {
+        let key = read_private_secret(key_file).context("odczyt klucza odzyskiwania Matrix")?;
+        self.client
+            .sync_once(SyncSettings::new().timeout(Duration::ZERO))
+            .await?;
+        self.client
+            .encryption()
+            .recovery()
+            .recover(key.expose_secret())
+            .await?;
+        self.check_device().await
     }
 
-    pub async fn sync(&self, since: Option<&str>, timeout_ms: u32) -> Result<SyncResponse> {
-        let mut url = format!(
-            "{}/_matrix/client/v3/sync?timeout={}",
-            self.base, timeout_ms
+    pub async fn verify_user(&self, mxid: &str, expected_key: &str) -> Result<()> {
+        ensure!(
+            self.audience
+                .as_ref()
+                .is_none_or(|audience| audience.contains(mxid))
+                && self
+                    .client
+                    .user_id()
+                    .is_some_and(|own| own.as_str() != mxid),
+            "weryfikowany użytkownik musi być na MATRIX_ALLOWED_USERS"
         );
-        if let Some(s) = since {
-            url.push_str(&format!("&since={}", enc(s)));
-        }
-        let resp = self
-            .authed(self.http.get(&url))
-            .send()
-            .await
-            .context("sync: send")?;
-        let status = resp.status();
-        let body = resp.text().await?;
-        if !status.is_success() {
-            anyhow::bail!("sync: HTTP {status}: {}", &body[..body.len().min(300)]);
-        }
-        let parsed: SyncResponse = serde_json::from_str(&body).context("sync: parse json")?;
-        Ok(parsed)
-    }
-
-    pub async fn send_text(&self, body: &str) -> Result<String> {
-        self.send_text_rel(body, None).await
-    }
-
-    /// send_text z opcjonalnym m.relates_to (np. wątek m.thread).
-    pub async fn send_text_rel(
-        &self,
-        body: &str,
-        rel: Option<serde_json::Value>,
-    ) -> Result<String> {
-        let txn = format!("rs{}", now_nanos());
-        let url = format!(
-            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
-            self.base,
-            enc(&self.room_id),
-            enc(&txn)
+        self.check_device().await?;
+        let user = UserId::parse(mxid)?;
+        let identity = self
+            .client
+            .encryption()
+            .request_user_identity(&user)
+            .await?
+            .context("użytkownik Matrix nie ma tożsamości cross-signing")?;
+        let key = identity
+            .master_key()
+            .get_first_key()
+            .context("brak klucza głównego Matrix")?;
+        ensure!(
+            key.to_base64() == expected_key.trim_end_matches('='),
+            "odcisk klucza Matrix różni się od sprawdzonego poza mostkiem"
         );
-        let mut content = serde_json::json!({"msgtype": "m.text", "body": body});
-        if let Some(r) = rel {
-            content["m.relates_to"] = r;
-        }
-        let resp = self
-            .authed(self.http.put(&url))
-            .json(&content)
-            .send()
-            .await
-            .context("send_text: send")?;
-        let status = resp.status();
-        let body = resp.text().await?;
-        if !status.is_success() {
-            anyhow::bail!("send_text: HTTP {status}: {}", &body[..body.len().min(300)]);
-        }
-        let v: serde_json::Value = serde_json::from_str(&body)?;
-        Ok(v["event_id"].as_str().unwrap_or("").to_string())
-    }
-
-    pub async fn react(&self, event_id: &str, emoji: &str) -> Result<()> {
-        // reakcję wysyłamy jako zwykły event m.reaction; key MUSI być wewnątrz m.relates_to.
-        let txn = format!("rx{}", now_nanos());
-        let url = format!(
-            "{}/_matrix/client/v3/rooms/{}/send/m.reaction/{}",
-            self.base,
-            enc(&self.room_id),
-            enc(&txn)
+        identity.verify().await?;
+        ensure!(
+            self.client
+                .encryption()
+                .request_user_identity(&user)
+                .await?
+                .is_some_and(|identity| identity.is_verified()),
+            "tożsamość Matrix nie została zweryfikowana"
         );
-        let resp = self
-            .authed(self.http.put(&url))
-            .json(&serde_json::json!({
-                "m.relates_to": {"rel_type": "m.annotation", "event_id": event_id, "key": emoji}
-            }))
-            .send()
-            .await
-            .context("react: send")?;
-        if !resp.status().is_success() {
-            let b = resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                emoji,
-                event_id,
-                "reakcja nieudana: {}",
-                &b[..b.len().min(200)]
-            );
-        }
         Ok(())
     }
 
-    /// Pobiera media z mxc://server/media_id. Zwraca (filename, bytes, mime).
-    pub async fn download_mxc(&self, mxc: &str) -> Result<(String, Vec<u8>, String)> {
-        let rest = mxc
-            .strip_prefix("mxc://")
-            .context("zły mxc (brak mxc://)")?;
-        let (server, media_id) = rest.split_once('/').context("zły mxc (brak /)")?;
-        // Uwaga: ten Synapse (matrix.owl-post.eu) wystawia tylko legacy v1 — v3 daje 404.
-        // Próbujemy v1, fallback v3 (inne serwery).
-        let url_v1 = format!(
-            "{}/_matrix/client/v1/media/download/{}/{}",
-            self.base,
-            enc(server),
-            enc(media_id)
+    pub async fn check_device(&self) -> Result<()> {
+        ensure!(
+            self.client
+                .encryption()
+                .get_own_device()
+                .await?
+                .is_some_and(|device| device.is_verified_with_cross_signing()),
+            "urządzenie mostka wymaga weryfikacji cross-signing; użyj recover-device"
         );
-        let url_v3 = format!(
-            "{}/_matrix/media/v3/download/{}/{}",
-            self.base,
-            enc(server),
-            enc(media_id)
+        Ok(())
+    }
+
+    fn encrypted_room(&self) -> Result<Room> {
+        let room = self
+            .client
+            .get_room(&self.room_id)
+            .context("konto mostka musi dołączyć do pokoju Matrix")?;
+        ensure!(
+            room.state() == RoomState::Joined,
+            "konto mostka nie jest uczestnikiem pokoju"
         );
-        let resp = self
-            .authed(self.http.get(&url_v1))
-            .send()
-            .await
-            .context("download: send v1")?;
-        let resp = if resp.status().is_success() {
-            resp
-        } else {
-            tracing::warn!(mxc, "v1 404, próbuję v3");
-            self.authed(self.http.get(&url_v3))
-                .send()
+        ensure!(
+            room.encryption_state().is_encrypted(),
+            "pokój Matrix musi mieć włączone E2EE"
+        );
+        Ok(room)
+    }
+
+    async fn ready_to_send(&self) -> Result<Room> {
+        self.check_device().await?;
+        let room = self.encrypted_room()?;
+        if let Some(audience) = &self.audience {
+            let response = self
+                .client
+                .send(joined_members::v3::Request::new(self.room_id.clone()))
                 .await
-                .context("download: send v3")?
-        };
-        let status = resp.status();
-        let mime = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .split(';')
-            .next()
-            .unwrap_or("application/octet-stream")
-            .to_string();
-        let cd = resp
-            .headers()
-            .get("content-disposition")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let bytes = resp.bytes().await.context("download: body")?.to_vec();
-        if !status.is_success() {
-            anyhow::bail!("download: HTTP {status} ({} bajtów)", bytes.len());
-        }
-        let filename = cd
-            .split("filename=\"")
-            .nth(1)
-            .and_then(|s| s.split('"').next())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("{media_id}.ogg"));
-        Ok((filename, bytes, mime))
-    }
-
-    /// Upload media na homeserver. Zwraca mxc://...
-    pub async fn upload_media(&self, bytes: &[u8], filename: &str, mime: &str) -> Result<String> {
-        let url = format!(
-            "{}/_matrix/media/v3/upload?filename={}",
-            self.base,
-            enc(filename)
-        );
-        let resp = self
-            .authed(self.http.post(&url))
-            .header("content-type", mime)
-            .body(bytes.to_vec())
-            .send()
-            .await
-            .context("upload: send")?;
-        let status = resp.status();
-        let body = resp.text().await?;
-        if !status.is_success() {
-            anyhow::bail!("upload: HTTP {status}: {}", &body[..body.len().min(300)]);
-        }
-        let v: serde_json::Value = serde_json::from_str(&body)?;
-        Ok(v["content_uri"]
-            .as_str()
-            .context("upload: brak content_uri")?
-            .to_string())
-    }
-
-    /// Wysyła voice message (m.audio + org.matrix.msc3245.voice).
-    pub async fn send_audio_rel(
-        &self,
-        body: &str,
-        mxc: &str,
-        mime: &str,
-        size: usize,
-        duration_ms: u32,
-        waveform: &[u32],
-        rel: Option<serde_json::Value>,
-    ) -> Result<String> {
-        let txn = format!("au{}", now_nanos());
-        let url = format!(
-            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
-            self.base,
-            enc(&self.room_id),
-            enc(&txn)
-        );
-        let mut content = serde_json::json!({
-            "msgtype": "m.audio",
-            "body": body,
-            "url": mxc,
-            "info": { "mimetype": mime, "size": size, "duration": duration_ms },
-            "org.matrix.msc3245.voice": true,
-            "org.matrix.msc1767.audio": [{ "waveform": waveform, "duration": duration_ms }],
-        });
-        if let Some(r) = rel {
-            content["m.relates_to"] = r;
-        }
-        let resp = self
-            .authed(self.http.put(&url))
-            .json(&content)
-            .send()
-            .await
-            .context("send_audio: send")?;
-        let status = resp.status();
-        let body = resp.text().await?;
-        if !status.is_success() {
-            anyhow::bail!(
-                "send_audio: HTTP {status}: {}",
-                &body[..body.len().min(300)]
+                .context("sprawdzenie uczestników pokoju Matrix")?;
+            ensure!(
+                !response.joined.is_empty()
+                    && response
+                        .joined
+                        .keys()
+                        .all(|user| audience.contains(user.as_str())),
+                "wstrzymano publikację: w pokoju są uczestnicy spoza MATRIX_ALLOWED_USERS"
             );
         }
-        let v: serde_json::Value = serde_json::from_str(&body)?;
-        Ok(v["event_id"].as_str().unwrap_or("").to_string())
+        Ok(room)
+    }
+
+    pub async fn sync(&self, since: Option<&str>, timeout_ms: u32) -> Result<SyncBatch> {
+        let mut filter = FilterDefinition::default();
+        filter.room.rooms = Some(vec![self.room_id.clone()]);
+        let settings = SyncSettings::new()
+            .filter(Filter::FilterDefinition(filter))
+            .timeout(Duration::from_millis(u64::from(timeout_ms)))
+            .token(since.map_or(SyncToken::NoToken, |value| {
+                SyncToken::Specific(value.to_owned())
+            }));
+        let response = self
+            .client
+            .sync_once(settings)
+            .await
+            .context("synchronizacja Matrix E2EE")?;
+        self.encrypted_room()?;
+        if since.is_none() {
+            self.check_device().await?;
+        }
+        let events = response
+            .rooms
+            .joined
+            .get(&self.room_id)
+            .into_iter()
+            .flat_map(|room| &room.timeline.events)
+            .filter_map(authenticated_event)
+            .collect();
+        Ok(SyncBatch {
+            next_batch: response.next_batch,
+            events,
+        })
+    }
+
+    pub async fn send_text(&self, body: &str) -> Result<String> {
+        let room = self.ready_to_send().await?;
+        let event = room.send(RoomMessageEventContent::text_plain(body)).await?;
+        Ok(event.response.event_id.to_string())
+    }
+
+    /// Download encrypted bytes from the authenticated homeserver, never from a URL
+    /// supplied by the sender. The SDK decryptor verifies the ciphertext digest.
+    pub async fn download_mxc(
+        &self,
+        content: &EventContent,
+        limit: usize,
+    ) -> Result<(String, Vec<u8>, String)> {
+        let file = content
+            .file
+            .as_ref()
+            .context("odrzucono niezaszyfrowany załącznik Matrix")?;
+        let (server, media_id) = file.url.parts()?;
+        let mut url = self.homeserver.clone();
+        url.path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("nie można zbudować adresu mediów Matrix"))?
+            .pop_if_empty()
+            .extend([
+                "_matrix",
+                "client",
+                "v1",
+                "media",
+                "download",
+                server.as_str(),
+                media_id,
+            ]);
+        let token = self.client.access_token().context("brak sesji Matrix")?;
+        let mut response = self
+            .http
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await?
+            .error_for_status()?;
+        ensure!(
+            response.status().is_success(),
+            "nieoczekiwany status pobrania mediów"
+        );
+        ensure!(
+            response
+                .content_length()
+                .is_none_or(|length| length <= limit as u64),
+            "plik Matrix przekracza {limit} bajtów"
+        );
+        let mut ciphertext = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            ensure!(
+                chunk.len() <= limit - ciphertext.len(),
+                "plik Matrix przekracza {limit} bajtów"
+            );
+            ciphertext.extend_from_slice(&chunk);
+        }
+        let mut ciphertext = Cursor::new(ciphertext);
+        let mut reader = AttachmentDecryptor::new(&mut ciphertext, file.clone().into())?;
+        let mut plaintext = Vec::new();
+        reader
+            .read_to_end(&mut plaintext)
+            .context("weryfikacja i odszyfrowanie załącznika")?;
+        let mime = content
+            .info
+            .as_ref()
+            .and_then(|info| info["mimetype"].as_str())
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        Ok((content.body.clone(), plaintext, mime))
+    }
+
+    pub async fn send_image(
+        &self,
+        filename: &str,
+        mime: &str,
+        bytes: Vec<u8>,
+        transaction: &str,
+    ) -> Result<String> {
+        let config =
+            AttachmentConfig::new()
+                .txn_id(transaction.into())
+                .info(AttachmentInfo::Image(BaseImageInfo {
+                    size: bytes.len().try_into().ok(),
+                    ..Default::default()
+                }));
+        self.send_attachment(filename, mime, bytes, config).await
     }
 
     pub async fn send_audio(
         &self,
-        body: &str,
-        mxc: &str,
+        filename: &str,
         mime: &str,
-        size: usize,
-        duration_ms: u32,
-        waveform: &[u32],
+        bytes: Vec<u8>,
+        duration: Duration,
     ) -> Result<String> {
-        self.send_audio_rel(body, mxc, mime, size, duration_ms, waveform, None)
-            .await
+        let info = BaseAudioInfo {
+            duration: Some(duration),
+            size: bytes.len().try_into().ok(),
+            waveform: None,
+        };
+        let config = AttachmentConfig::new().info(if mime == "audio/ogg" {
+            AttachmentInfo::Voice(info)
+        } else {
+            AttachmentInfo::Audio(info)
+        });
+        self.send_attachment(filename, mime, bytes, config).await
+    }
+
+    async fn send_attachment(
+        &self,
+        filename: &str,
+        mime: &str,
+        bytes: Vec<u8>,
+        config: AttachmentConfig,
+    ) -> Result<String> {
+        let room = self.ready_to_send().await?;
+        let Ok(mime) = mime.parse() else {
+            bail!("nieprawidłowy typ załącznika")
+        };
+        let event = room.send_attachment(filename, &mime, bytes, config).await?;
+        Ok(event.event_id.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use matrix_sdk::{deserialized_responses::TimelineEvent, ruma::serde::Raw};
+
+    #[test]
+    fn plaintext_commands_are_never_authenticated() {
+        let json = serde_json::json!({
+            "type": "m.room.message", "sender": "@operator:example.org", "event_id": "$1",
+            "origin_server_ts": 100, "content": {"msgtype": "m.text", "body": "/new work"}
+        });
+        let event = TimelineEvent::from_plaintext(Raw::from_json_string(json.to_string()).unwrap());
+        assert!(authenticated_event(&event).is_none());
+    }
+
+    #[test]
+    fn token_is_only_used_with_https_or_explicit_test_loopback() {
+        assert!(homeserver_url("https://matrix.example.org", false).is_ok());
+        assert!(homeserver_url("http://matrix.example.org", true).is_err());
+        assert!(homeserver_url("https://user:password@matrix.example.org", false).is_err());
+        assert!(homeserver_url("http://127.0.0.1:8008", false).is_err());
+        assert!(homeserver_url("http://127.0.0.1:8008", true).is_ok());
     }
 }
